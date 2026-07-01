@@ -1,0 +1,25 @@
+[
+  {
+    "id": 0,
+    "name": "eDP-1",
+    "description": "Chimei Innolux Corporation 0x13C0",
+    "make": "Chimei Innolux Corporation",
+    "model": "0x13C0",
+    "serial": "",
+    "width": 1920,
+    "height": 1280,
+    "refreshRate": 60.003,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0,
+    "focused": true,
+    "dpmsStatus": true,
+    "disabled": false,
+    "physicalWidth": 300,
+    "physicalHeight": 200,
+    "availableModes": ["1920x1280@60.00Hz"],
+    "activeWorkspace": { "id": 1, "name": "1" },
+    "colorManagementPreset": "srgb"
+  }
+]

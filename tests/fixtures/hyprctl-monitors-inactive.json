@@ -1,0 +1,21 @@
+[
+  {
+    "id": 2,
+    "name": "HDMI-A-1",
+    "description": "Dell Inc. DELL U2415 99999",
+    "make": "Dell Inc.",
+    "model": "DELL U2415",
+    "serial": "99999",
+    "width": 1920,
+    "height": 1200,
+    "refreshRate": 59.95,
+    "x": -1920,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0,
+    "disabled": true,
+    "physicalWidth": 520,
+    "physicalHeight": 320,
+    "availableModes": ["1920x1200@59.95Hz"]
+  }
+]
