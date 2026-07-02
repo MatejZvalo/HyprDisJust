@@ -1,0 +1,40 @@
+[
+  {
+    "id": 0,
+    "name": "HDMI-A-1",
+    "description": "LG Electronics LG ULTRAGEAR 12345",
+    "make": "LG Electronics",
+    "model": "LG ULTRAGEAR",
+    "serial": "12345",
+    "width": 2560,
+    "height": 1440,
+    "refreshRate": 144.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0,
+    "disabled": false,
+    "physicalWidth": 600,
+    "physicalHeight": 340,
+    "availableModes": ["2560x1440@144.00Hz", "1920x1080@60.00Hz"]
+  },
+  {
+    "id": 1,
+    "name": "eDP-2",
+    "description": "BOE Internal Panel",
+    "make": "BOE",
+    "model": "Internal Panel",
+    "serial": "",
+    "width": 1920,
+    "height": 1200,
+    "refreshRate": 60.0,
+    "x": 2560,
+    "y": 240,
+    "scale": 1.0,
+    "transform": 0,
+    "disabled": false,
+    "physicalWidth": 290,
+    "physicalHeight": 180,
+    "availableModes": ["1920x1200@60.00Hz"]
+  }
+]
