@@ -1,8 +1,16 @@
+use std::env;
+use std::fs;
+
 use anyhow::bail;
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::config::ConfigPaths;
+use crate::hyprland::hyprctl::parse_monitors_output;
 use crate::hyprland::hyprctl::HyprctlClient;
 use crate::hyprland::monitor::MonitorState;
+use crate::profile::store::ProfileStore;
+
+const MONITORS_JSON_ENV: &str = "HYPRDISJUST_MONITORS_JSON";
 
 #[derive(Debug, Parser)]
 #[command(name = "hyprdisjust")]
@@ -22,6 +30,9 @@ enum Commands {
     Save {
         /// Profile name. A default name will be chosen later when omitted.
         name: Option<String>,
+        /// Replace an existing profile with the same name.
+        #[arg(long)]
+        replace: bool,
     },
     /// Apply a saved profile or choose one automatically.
     Apply {
@@ -56,8 +67,24 @@ pub fn run() -> anyhow::Result<()> {
             let monitors = client.monitors_all()?;
             println!("{}", format_doctor(&monitors));
         }
-        Commands::List => not_implemented("list")?,
-        Commands::Save { .. } => not_implemented("save")?,
+        Commands::List => {
+            let paths = ConfigPaths::resolve()?;
+            let store = ProfileStore::load(paths.profile_store_path())?;
+            println!("{}", format_profile_list(&store));
+        }
+        Commands::Save { name, replace } => {
+            let paths = ConfigPaths::resolve()?;
+            let monitors = current_monitors()?;
+            let mut store = ProfileStore::load(paths.profile_store_path())?;
+            let saved_name = store.save_current_profile(name.as_deref(), &monitors, replace)?;
+            store.save_atomic(paths.profile_store_path())?;
+            println!(
+                "Saved profile `{}` with {} monitor{}.",
+                saved_name,
+                monitors.len(),
+                if monitors.len() == 1 { "" } else { "s" }
+            );
+        }
         Commands::Apply { .. } => not_implemented("apply")?,
         Commands::Daemon => not_implemented("daemon")?,
         Commands::Export { .. } => not_implemented("export")?,
@@ -68,6 +95,34 @@ pub fn run() -> anyhow::Result<()> {
 
 fn not_implemented(command: &str) -> anyhow::Result<()> {
     bail!("`{command}` is not implemented yet")
+}
+
+fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
+    if let Some(path) = env::var_os(MONITORS_JSON_ENV) {
+        let contents = fs::read_to_string(&path)?;
+        return parse_monitors_output(&contents);
+    }
+
+    let client = HyprctlClient;
+    client.monitors_all()
+}
+
+pub fn format_profile_list(store: &ProfileStore) -> String {
+    if store.profiles.is_empty() {
+        return "No profiles saved yet.".to_owned();
+    }
+
+    let mut output = format!("Profiles: {}", store.profiles.len());
+    for profile in &store.profiles {
+        output.push_str(&format!(
+            "\n- {} ({} monitor{})",
+            profile.name,
+            profile.monitors.len(),
+            if profile.monitors.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    output
 }
 
 pub fn format_doctor(monitors: &[MonitorState]) -> String {

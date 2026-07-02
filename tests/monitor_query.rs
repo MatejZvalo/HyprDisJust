@@ -7,6 +7,39 @@ const LAPTOP: &str = include_str!("fixtures/hyprctl-monitors-laptop.json");
 const DESK: &str = include_str!("fixtures/hyprctl-monitors-desk.json");
 const INACTIVE: &str = include_str!("fixtures/hyprctl-monitors-inactive.json");
 
+const DUPLICATE_NO_SERIAL: &str = r#"[
+  {
+    "id": 0,
+    "name": "DP-1",
+    "description": "Acme SamePanel",
+    "make": "Acme",
+    "model": "SamePanel",
+    "serial": "",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0
+  },
+  {
+    "id": 1,
+    "name": "DP-2",
+    "description": "Acme SamePanel",
+    "make": "Acme",
+    "model": "SamePanel",
+    "serial": "",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 1920,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0
+  }
+]"#;
+
 #[test]
 fn active_laptop_fixture_parses() {
     let monitors = parse_monitors_output(LAPTOP).unwrap();
@@ -46,6 +79,15 @@ fn inactive_fixture_normalizes_enabled_false() {
     assert_eq!(monitors.len(), 1);
     assert!(!monitors[0].enabled);
     assert_eq!(monitors[0].x, -1920);
+}
+
+#[test]
+fn duplicate_no_serial_monitor_ids_are_disambiguated_by_output_name() {
+    let monitors = parse_monitors_output(DUPLICATE_NO_SERIAL).unwrap();
+
+    assert_eq!(monitors.len(), 2);
+    assert_eq!(monitors[0].id, "acme:samepanel:no-serial:output:dp-1");
+    assert_eq!(monitors[1].id, "acme:samepanel:no-serial:output:dp-2");
 }
 
 #[test]

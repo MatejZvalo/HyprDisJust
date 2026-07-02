@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RawHyprMonitor {
     pub id: i64,
@@ -53,6 +55,12 @@ pub struct MonitorState {
 
 pub fn parse_raw_monitors(json: &str) -> anyhow::Result<Vec<RawHyprMonitor>> {
     Ok(serde_json::from_str(json)?)
+}
+
+pub fn normalize_monitors(raw_monitors: Vec<RawHyprMonitor>) -> Vec<MonitorState> {
+    let mut monitors: Vec<_> = raw_monitors.into_iter().map(MonitorState::from).collect();
+    disambiguate_duplicate_monitor_ids(&mut monitors);
+    monitors
 }
 
 impl From<RawHyprMonitor> for MonitorState {
@@ -142,6 +150,44 @@ pub fn slug_component(input: &str) -> String {
         "unknown".to_owned()
     } else {
         slug.to_owned()
+    }
+}
+
+fn disambiguate_duplicate_monitor_ids(monitors: &mut [MonitorState]) {
+    let mut counts = HashMap::new();
+    for monitor in monitors.iter() {
+        *counts.entry(monitor.id.clone()).or_insert(0usize) += 1;
+    }
+
+    let mut used_ids: HashSet<String> = counts
+        .iter()
+        .filter_map(
+            |(id, count)| {
+                if *count == 1 {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            },
+        )
+        .collect();
+
+    for monitor in monitors {
+        if counts.get(&monitor.id).copied().unwrap_or_default() <= 1 {
+            continue;
+        }
+
+        let base = monitor.id.clone();
+        let candidate_base = format!("{base}:output:{}", slug_component(&monitor.output_name));
+        let mut candidate = candidate_base.clone();
+        let mut suffix = 2;
+        while used_ids.contains(&candidate) {
+            candidate = format!("{candidate_base}-{suffix}");
+            suffix += 1;
+        }
+
+        used_ids.insert(candidate.clone());
+        monitor.id = candidate;
     }
 }
 
