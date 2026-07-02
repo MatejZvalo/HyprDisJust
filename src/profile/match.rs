@@ -240,7 +240,7 @@ fn scored_pairs(profile_monitor: &ProfileMonitor, current: &[MonitorState]) -> V
         .iter()
         .enumerate()
         .map(|(current_index, monitor)| {
-            let (score, reason) = monitor_pair_score(profile_monitor, monitor);
+            let (score, reason) = profile_monitor_match_score(profile_monitor, monitor);
             PairScore {
                 current_index,
                 score,
@@ -250,7 +250,7 @@ fn scored_pairs(profile_monitor: &ProfileMonitor, current: &[MonitorState]) -> V
         .collect()
 }
 
-fn monitor_pair_score(
+pub fn profile_monitor_match_score(
     profile_monitor: &ProfileMonitor,
     current: &MonitorState,
 ) -> (i32, &'static str) {

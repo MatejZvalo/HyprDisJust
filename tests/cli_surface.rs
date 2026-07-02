@@ -29,8 +29,6 @@ fn help_lists_bootstrap_command_surface() {
 #[test]
 fn unimplemented_commands_return_clear_errors() {
     for args in [
-        vec!["apply", "desk"],
-        vec!["apply", "--auto"],
         vec!["daemon"],
         vec!["export", "--format", "conf"],
         vec!["export", "--format", "lua"],
@@ -44,6 +42,21 @@ fn unimplemented_commands_return_clear_errors() {
             "expected not-implemented error for {args:?}, got:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn apply_unknown_profile_returns_clear_error() {
+    let config_dir = tempdir().unwrap();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .args(["apply", "missing", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("profile `missing` does not exist"));
 }
 
 #[test]

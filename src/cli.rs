@@ -9,6 +9,8 @@ use crate::hyprland::hyprctl::parse_monitors_output;
 use crate::hyprland::hyprctl::HyprctlClient;
 use crate::hyprland::monitor::MonitorState;
 use crate::profile::r#match::{best_profile_match, BestProfileMatch, ProfileMatch};
+use crate::profile::render::{format_hyprctl_batch_command, render_monitor_rules};
+use crate::profile::store::Profile;
 use crate::profile::store::ProfileStore;
 
 const MONITORS_JSON_ENV: &str = "HYPRDISJUST_MONITORS_JSON";
@@ -117,32 +119,48 @@ fn not_implemented(command: &str) -> anyhow::Result<()> {
 }
 
 fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()> {
-    if name.is_some() {
-        return not_implemented("apply");
+    if name.is_some() && auto {
+        bail!("pass either a profile name or --auto, not both");
     }
 
-    if auto && dry_run {
-        let paths = ConfigPaths::resolve()?;
+    let paths = ConfigPaths::resolve()?;
+    let store = ProfileStore::load(paths.profile_store_path())?;
+
+    if let Some(name) = name {
+        let profile = profile_by_name(&store, name)?;
         let monitors = current_monitors()?;
-        let store = ProfileStore::load(paths.profile_store_path())?;
-        let config = AppConfig::load(paths.config_file_path())?;
-        let best_match = best_profile_match(&store, &monitors);
-        println!(
-            "{}",
-            format_auto_apply_dry_run(&best_match, &store, config.fallback_profile.as_deref())
-        );
+        let rendered = render_monitor_rules(profile, &monitors)?;
+        apply_or_print(profile, &rendered.batch, &monitors, dry_run)?;
         return Ok(());
     }
 
-    if auto {
-        bail!("`apply --auto` live layout changes are not implemented yet; use --dry-run to preview profile matching");
+    if !auto {
+        bail!("`apply` requires a profile name or --auto");
     }
+
+    let monitors = current_monitors()?;
+    let config = AppConfig::load(paths.config_file_path())?;
+    let best_match = best_profile_match(&store, &monitors);
 
     if dry_run {
-        bail!("`apply --dry-run` requires --auto until live apply is implemented");
+        let mut output =
+            format_auto_apply_dry_run(&best_match, &store, config.fallback_profile.as_deref());
+        if let Some(profile) =
+            auto_profile_candidate(&store, &best_match, config.fallback_profile.as_deref())
+        {
+            let rendered = render_monitor_rules(profile, &monitors)?;
+            output.push_str("\n\n");
+            output.push_str(&format_apply_commands(profile, &rendered.batch));
+        } else {
+            output.push_str("\n\nCommands: none");
+        }
+        println!("{output}");
+        return Ok(());
     }
 
-    not_implemented("apply")
+    let profile = require_auto_profile(&store, &best_match, config.fallback_profile.as_deref())?;
+    let rendered = render_monitor_rules(profile, &monitors)?;
+    apply_or_print(profile, &rendered.batch, &monitors, dry_run)
 }
 
 fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
@@ -153,6 +171,114 @@ fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
 
     let client = HyprctlClient;
     client.monitors_all()
+}
+
+fn profile_by_name<'a>(store: &'a ProfileStore, name: &str) -> anyhow::Result<&'a Profile> {
+    store
+        .profiles
+        .iter()
+        .find(|profile| profile.name == name)
+        .ok_or_else(|| anyhow::anyhow!("profile `{name}` does not exist"))
+}
+
+fn auto_profile_candidate<'a>(
+    store: &'a ProfileStore,
+    best_match: &BestProfileMatch,
+    fallback_profile: Option<&str>,
+) -> Option<&'a Profile> {
+    if let Some(selected) = best_match
+        .selected
+        .as_ref()
+        .filter(|selected| selected.confidence.is_auto_apply_eligible())
+    {
+        return profile_by_name(store, &selected.profile_name).ok();
+    }
+
+    if best_match.ambiguous && has_auto_eligible_candidate(best_match) {
+        return None;
+    }
+
+    normalized_fallback_profile(fallback_profile).and_then(|fallback_profile| {
+        store
+            .profiles
+            .iter()
+            .find(|profile| profile.name == fallback_profile)
+    })
+}
+
+fn require_auto_profile<'a>(
+    store: &'a ProfileStore,
+    best_match: &BestProfileMatch,
+    fallback_profile: Option<&str>,
+) -> anyhow::Result<&'a Profile> {
+    if let Some(profile) = auto_profile_candidate(store, best_match, fallback_profile) {
+        return Ok(profile);
+    }
+
+    if store.profiles.is_empty() {
+        bail!("no profiles saved");
+    }
+
+    if best_match.ambiguous && has_auto_eligible_candidate(best_match) {
+        let reason = best_match
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.reasons.first())
+            .map(String::as_str)
+            .unwrap_or("multiple profiles or monitors matched equally");
+        bail!("automatic apply is ambiguous: {reason}");
+    }
+
+    if let Some(fallback_profile) = normalized_fallback_profile(fallback_profile) {
+        bail!("fallback_profile `{fallback_profile}` does not exist");
+    }
+
+    if let Some(selected) = &best_match.selected {
+        let reason = selected
+            .reasons
+            .first()
+            .map(String::as_str)
+            .unwrap_or("profile match is not eligible for automatic apply");
+        bail!("no exact or high-confidence profile match: {reason}");
+    }
+
+    bail!("no useful profile match")
+}
+
+fn apply_or_print(
+    profile: &Profile,
+    batch: &str,
+    previous_monitors: &[MonitorState],
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run {
+        println!("{}", format_apply_commands(profile, batch));
+        return Ok(());
+    }
+
+    let client = HyprctlClient;
+    if let Err(error) = client.apply_monitor_batch(batch) {
+        bail!(
+            "{error}\nPrevious layout:\n{}",
+            format_doctor(previous_monitors)
+        );
+    }
+
+    println!(
+        "Applied profile `{}` with {} monitor rule{}.",
+        profile.name,
+        profile.outputs.len(),
+        if profile.outputs.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+fn format_apply_commands(profile: &Profile, batch: &str) -> String {
+    format!(
+        "Profile: {}\nCommand:\n{}",
+        profile.name,
+        format_hyprctl_batch_command(batch)
+    )
 }
 
 pub fn format_auto_apply_dry_run(

@@ -345,6 +345,33 @@ fn apply_auto_dry_run_explains_selected_profile() {
     assert!(stdout.contains("Auto-apply dry run"));
     assert!(stdout.contains("Would select profile: desk"));
     assert!(stdout.contains("Confidence: exact"));
+    assert!(stdout.contains(
+        "hyprctl --batch \"keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1\""
+    ));
+}
+
+#[test]
+fn apply_named_dry_run_prints_exact_hyprctl_batch() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path().join("profiles.toml"));
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture_path())
+        .args(["apply", "desk", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Profile: desk"));
+    assert!(stdout.contains(
+        "hyprctl --batch \"keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1\""
+    ));
 }
 
 fn profile_from_monitors(name: &str, monitors: &[MonitorState]) -> Profile {
