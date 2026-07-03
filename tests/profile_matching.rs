@@ -4,6 +4,7 @@ use std::process::Command;
 
 use hyprdisjust::cli::format_auto_apply_dry_run;
 use hyprdisjust::config::AppConfig;
+use hyprdisjust::daemon::{decide_auto_apply, AutoApplyDecision};
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
 use hyprdisjust::hyprland::monitor::MonitorState;
 use hyprdisjust::profile::r#match::{best_profile_match, match_profile, MatchConfidence};
@@ -243,6 +244,90 @@ fn fallback_profile_is_used_only_without_high_confidence_match() {
 }
 
 #[test]
+fn auto_apply_decision_selects_exact_match() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .profiles
+        .push(profile_from_monitors("desk", &monitors));
+
+    let best_match = best_profile_match(&store, &monitors);
+    let decision = decide_auto_apply(&store, &best_match, Some("fallback"));
+
+    assert_eq!(
+        decision,
+        AutoApplyDecision::Apply {
+            profile_name: "desk".to_owned(),
+            confidence: "exact".to_owned(),
+            reason: "2/2 monitor identities matched exactly".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn auto_apply_decision_uses_fallback_without_high_confidence_match() {
+    let desk = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store.profiles.push(profile_from_monitors("desk", &desk));
+    store
+        .profiles
+        .push(profile_from_monitors("fallback", &[unknown_monitor()]));
+
+    let best_match = best_profile_match(&store, &[other_unknown_monitor()]);
+    let decision = decide_auto_apply(&store, &best_match, Some("fallback"));
+
+    assert_eq!(
+        decision,
+        AutoApplyDecision::Apply {
+            profile_name: "fallback".to_owned(),
+            confidence: "fallback".to_owned(),
+            reason: "no exact or high-confidence match; fallback_profile is configured".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn auto_apply_decision_refuses_ambiguous_exact_match() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .profiles
+        .push(profile_from_monitors("desk-a", &monitors));
+    store
+        .profiles
+        .push(profile_from_monitors("desk-b", &monitors));
+
+    let best_match = best_profile_match(&store, &monitors);
+    let decision = decide_auto_apply(&store, &best_match, Some("fallback"));
+
+    assert_eq!(
+        decision,
+        AutoApplyDecision::Ambiguous {
+            reason: "2/2 monitor identities matched exactly".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn auto_apply_decision_reports_missing_fallback() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .profiles
+        .push(profile_from_monitors("desk", &monitors));
+
+    let best_match = best_profile_match(&store, &[unknown_monitor()]);
+    let decision = decide_auto_apply(&store, &best_match, Some("missing"));
+
+    assert_eq!(
+        decision,
+        AutoApplyDecision::MissingFallback {
+            profile_name: "missing".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn fallback_profile_is_used_when_best_candidate_is_not_auto_eligible() {
     let desk = parse_monitors_output(DESK).unwrap();
     let laptop =
@@ -280,6 +365,25 @@ fn app_config_loads_optional_fallback_profile() {
     let config = AppConfig::load(&config_path).unwrap();
 
     assert_eq!(config.fallback_profile.as_deref(), Some("laptop"));
+    assert_eq!(config.debounce_ms, 900);
+    assert!(!config.apply_on_start);
+}
+
+#[test]
+fn app_config_loads_daemon_fields() {
+    let temp = tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "fallback_profile = \"laptop\"\ndebounce_ms = 1250\napply_on_start = true\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::load(&config_path).unwrap();
+
+    assert_eq!(config.fallback_profile.as_deref(), Some("laptop"));
+    assert_eq!(config.debounce_ms, 1250);
+    assert!(config.apply_on_start);
 }
 
 #[test]
@@ -288,6 +392,8 @@ fn missing_app_config_loads_defaults() {
     let config = AppConfig::load(temp.path().join("config.toml")).unwrap();
 
     assert_eq!(config, AppConfig::default());
+    assert_eq!(config.debounce_ms, 900);
+    assert!(!config.apply_on_start);
 }
 
 #[test]

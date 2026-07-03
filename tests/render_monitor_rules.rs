@@ -1,6 +1,8 @@
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
 use hyprdisjust::hyprland::monitor::MonitorState;
-use hyprdisjust::profile::render::{render_hyprctl_batch, render_monitor_rules};
+use hyprdisjust::profile::render::{
+    render_hyprctl_batch, render_hyprland_conf, render_hyprland_lua, render_monitor_rules,
+};
 use hyprdisjust::profile::store::{Profile, ProfileMonitor, ProfileOutput};
 use pretty_assertions::assert_eq;
 
@@ -24,6 +26,10 @@ fn renders_exact_monitor_rules_from_saved_profile() {
     assert_eq!(
         rendered.batch,
         "keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1"
+    );
+    assert_eq!(
+        render_hyprland_conf(&rendered.rules).unwrap(),
+        "monitor = DP-1,2560x1440@144,0x0,1\nmonitor = eDP-1,1920x1200@60,2560x240,1"
     );
 }
 
@@ -84,6 +90,33 @@ fn renders_disabled_outputs_and_transform_args() {
             "monitor DP-3,1920x1080@60,-1080x0,1.5,transform,1",
             "monitor HDMI-A-2,disable",
         ]
+    );
+    assert_eq!(
+        render_hyprland_conf(&rendered.rules).unwrap(),
+        "monitor = DP-3,1920x1080@60,-1080x0,1.5,transform,1\nmonitor = HDMI-A-2,disable"
+    );
+}
+
+#[test]
+fn renders_lua_export_as_deterministic_keyword_calls() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let profile = profile_from_monitors("desk", &monitors);
+
+    let rendered = render_monitor_rules(&profile, &monitors).unwrap();
+
+    assert_eq!(
+        render_hyprland_lua(&rendered.rules).unwrap(),
+        "hyprland.keyword(\"monitor\", \"DP-1,2560x1440@144,0x0,1\")\nhyprland.keyword(\"monitor\", \"eDP-1,1920x1200@60,2560x240,1\")"
+    );
+}
+
+#[test]
+fn escapes_lua_monitor_rule_values() {
+    let rules = vec!["monitor DP\"1,preferred\\mode,0x0,1".to_owned()];
+
+    assert_eq!(
+        render_hyprland_lua(&rules).unwrap(),
+        "hyprland.keyword(\"monitor\", \"DP\\\"1,preferred\\\\mode,0x0,1\")"
     );
 }
 

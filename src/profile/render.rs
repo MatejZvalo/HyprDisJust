@@ -45,18 +45,50 @@ pub fn render_hyprctl_batch(rules: &[String]) -> anyhow::Result<String> {
 
     let mut commands = Vec::with_capacity(rules.len());
     for rule in rules {
-        validate_batch_component(rule, "monitor rule")?;
-        let value = rule
-            .strip_prefix("monitor ")
-            .with_context(|| format!("monitor rule `{rule}` must start with `monitor `"))?;
+        let value = monitor_rule_value(rule)?;
         commands.push(format!("keyword monitor {value}"));
     }
 
     Ok(commands.join(" ; "))
 }
 
+pub fn render_hyprland_conf(rules: &[String]) -> anyhow::Result<String> {
+    if rules.is_empty() {
+        bail!("cannot render an empty Hyprland monitor config");
+    }
+
+    let mut lines = Vec::with_capacity(rules.len());
+    for rule in rules {
+        lines.push(format!("monitor = {}", monitor_rule_value(rule)?));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+pub fn render_hyprland_lua(rules: &[String]) -> anyhow::Result<String> {
+    if rules.is_empty() {
+        bail!("cannot render an empty Hyprland monitor Lua config");
+    }
+
+    let mut lines = Vec::with_capacity(rules.len());
+    for rule in rules {
+        lines.push(format!(
+            "hyprland.keyword(\"monitor\", \"{}\")",
+            escape_lua_string(monitor_rule_value(rule)?)
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
 pub fn format_hyprctl_batch_command(batch: &str) -> String {
     format!("hyprctl --batch \"{}\"", batch.replace('"', "\\\""))
+}
+
+fn monitor_rule_value(rule: &str) -> anyhow::Result<&str> {
+    validate_batch_component(rule, "monitor rule")?;
+    rule.strip_prefix("monitor ")
+        .with_context(|| format!("monitor rule `{rule}` must start with `monitor `"))
 }
 
 fn resolve_current_output_name(
@@ -140,6 +172,10 @@ fn validate_batch_component(value: &str, label: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn escape_lua_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn profile_monitor_label(profile_monitor: &ProfileMonitor) -> String {

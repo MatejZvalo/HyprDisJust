@@ -1,7 +1,9 @@
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use directories::BaseDirs;
@@ -16,9 +18,13 @@ pub struct ConfigPaths {
     pub profile_store: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AppConfig {
     pub fallback_profile: Option<String>,
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+    #[serde(default)]
+    pub apply_on_start: bool,
 }
 
 impl ConfigPaths {
@@ -52,6 +58,63 @@ impl ConfigPaths {
     pub fn config_file_path(&self) -> &Path {
         &self.config_file
     }
+
+    pub fn generated_dir_path(&self) -> PathBuf {
+        self.config_dir.join("generated")
+    }
+
+    pub fn generated_monitors_conf_path(&self) -> PathBuf {
+        self.generated_dir_path().join("monitors.conf")
+    }
+
+    pub fn generated_monitors_lua_path(&self) -> PathBuf {
+        self.generated_dir_path().join("monitors.lua")
+    }
+}
+
+pub fn write_generated_file(path: impl AsRef<Path>, contents: &str) -> anyhow::Result<()> {
+    let path = path.as_ref();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create generated config directory {}",
+            parent.display()
+        )
+    })?;
+
+    let temp_path = unique_temp_path(path);
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary generated file {}",
+                    temp_path.display()
+                )
+            })?;
+        temp_file
+            .write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp_file
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to replace generated file {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    write_result
 }
 
 impl AppConfig {
@@ -69,4 +132,31 @@ impl AppConfig {
         toml::from_str(&contents)
             .with_context(|| format!("failed to parse config at {}", path.display()))
     }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            fallback_profile: None,
+            debounce_ms: default_debounce_ms(),
+            apply_on_start: false,
+        }
+    }
+}
+
+fn default_debounce_ms() -> u64 {
+    900
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("generated");
+    let process_id = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file_name}.{process_id}.{nanos}.tmp"))
 }

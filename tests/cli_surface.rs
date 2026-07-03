@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -27,21 +28,130 @@ fn help_lists_bootstrap_command_surface() {
 }
 
 #[test]
-fn unimplemented_commands_return_clear_errors() {
-    for args in [
-        vec!["daemon"],
-        vec!["export", "--format", "conf"],
-        vec!["export", "--format", "lua"],
-    ] {
-        let output = hyprdisjust().args(args.clone()).output().unwrap();
+fn daemon_once_dry_run_explains_selected_profile() {
+    let config_dir = tempdir().unwrap();
 
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(
-            stderr.contains("not implemented yet"),
-            "expected not-implemented error for {args:?}, got:\n{stderr}"
-        );
-    }
+    let save_output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["save", "desk"])
+        .output()
+        .unwrap();
+    assert!(
+        save_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&save_output.stderr)
+    );
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["daemon", "--once", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Auto-apply decision"));
+    assert!(stdout.contains("Selected profile: desk"));
+    assert!(stdout.contains("Confidence: exact"));
+    assert!(stdout.contains("Dry run: monitor layout was not changed"));
+    assert!(stdout.contains(
+        "hyprctl --batch \"keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1\""
+    ));
+}
+
+#[test]
+fn export_named_profile_writes_generated_conf() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["export", "desk", "--format", "conf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = config_dir.path().join("generated").join("monitors.conf");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "monitor = DP-1,2560x1440@144,0x0,1\nmonitor = eDP-1,1920x1200@60,2560x240,1"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Exported profile `desk` to "));
+    assert!(stdout.contains(&path.to_string_lossy().to_string()));
+}
+
+#[test]
+fn export_named_profile_writes_generated_lua() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["export", "desk", "--format", "lua"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(config_dir.path().join("generated").join("monitors.lua")).unwrap(),
+        "hyprland.keyword(\"monitor\", \"DP-1,2560x1440@144,0x0,1\")\nhyprland.keyword(\"monitor\", \"eDP-1,1920x1200@60,2560x240,1\")"
+    );
+}
+
+#[test]
+fn export_without_name_auto_selects_best_match() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["export", "--format", "conf"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(config_dir.path().join("generated").join("monitors.conf")).unwrap(),
+        "monitor = DP-1,2560x1440@144,0x0,1\nmonitor = eDP-1,1920x1200@60,2560x240,1"
+    );
+}
+
+#[test]
+fn export_unknown_profile_returns_clear_error() {
+    let config_dir = tempdir().unwrap();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["export", "missing", "--format", "conf"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("profile `missing` does not exist"));
 }
 
 #[test]
@@ -138,5 +248,20 @@ fn save_requires_replace_for_existing_profile() {
         replaced.status.success(),
         "{}",
         String::from_utf8_lossy(&replaced.stderr)
+    );
+}
+
+fn save_desk_profile(config_dir: &std::path::Path, name: &str) {
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir)
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["save", name])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

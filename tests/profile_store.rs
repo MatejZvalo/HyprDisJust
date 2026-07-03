@@ -53,6 +53,24 @@ fn config_paths_use_config_dir_override() {
 }
 
 #[test]
+fn config_paths_keep_generated_files_under_config_dir() {
+    let paths = ConfigPaths::from_config_dir("/tmp/hyprdisjust-test").unwrap();
+
+    assert_eq!(
+        paths.generated_dir_path().to_string_lossy(),
+        "/tmp/hyprdisjust-test/generated"
+    );
+    assert_eq!(
+        paths.generated_monitors_conf_path().to_string_lossy(),
+        "/tmp/hyprdisjust-test/generated/monitors.conf"
+    );
+    assert_eq!(
+        paths.generated_monitors_lua_path().to_string_lossy(),
+        "/tmp/hyprdisjust-test/generated/monitors.lua"
+    );
+}
+
+#[test]
 fn profile_store_roundtrips_as_toml() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("nested").join("profiles.toml");

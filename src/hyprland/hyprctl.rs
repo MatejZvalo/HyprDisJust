@@ -1,9 +1,13 @@
+use std::env;
+use std::fs;
 use std::io::ErrorKind;
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
 
 use super::monitor::{normalize_monitors, parse_raw_monitors, MonitorState};
+
+const MONITORS_JSON_ENV: &str = "HYPRDISJUST_MONITORS_JSON";
 
 pub struct HyprctlClient;
 
@@ -63,6 +67,21 @@ impl HyprctlClient {
 
         Ok(())
     }
+}
+
+pub fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
+    if let Some(path) = env::var_os(MONITORS_JSON_ENV) {
+        let contents = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "failed to read monitor fixture at {}",
+                path.to_string_lossy()
+            )
+        })?;
+        return parse_monitors_output(&contents);
+    }
+
+    let client = HyprctlClient;
+    client.monitors_all()
 }
 
 pub fn parse_monitors_output(stdout: &str) -> anyhow::Result<Vec<MonitorState>> {
