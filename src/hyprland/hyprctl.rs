@@ -65,6 +65,22 @@ impl HyprctlClient {
             ));
         }
 
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let unexpected_output = [stderr.as_ref(), stdout.as_ref()]
+            .into_iter()
+            .flat_map(str::lines)
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| *line != "ok")
+            .collect::<Vec<_>>();
+        if !unexpected_output.is_empty() {
+            return Err(anyhow!(
+                "failed to apply Hyprland monitor rules with `hyprctl --batch`: {}",
+                unexpected_output.join("\n")
+            ));
+        }
+
         Ok(())
     }
 }

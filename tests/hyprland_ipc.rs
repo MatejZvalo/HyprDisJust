@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use hyprdisjust::hyprland::ipc::{parse_monitor_event, socket2_path, MonitorSocketEvent};
+use hyprdisjust::hyprland::ipc::{
+    discover_socket2_path_with, parse_monitor_event, socket2_path, MonitorSocketEvent,
+};
 
 #[test]
 fn parses_socket2_monitor_events() {
@@ -37,4 +39,34 @@ fn builds_socket2_path() {
         path,
         PathBuf::from("/run/user/1000/hypr/signature/.socket2.sock")
     );
+}
+
+#[test]
+fn discovers_single_socket2_path_from_runtime_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let instance = temp.path().join("hypr").join("signature");
+    std::fs::create_dir_all(&instance).unwrap();
+    let socket = instance.join(".socket2.sock");
+    std::fs::write(&socket, "").unwrap();
+
+    assert_eq!(
+        discover_socket2_path_with(temp.path(), |path| path.exists()).unwrap(),
+        socket
+    );
+}
+
+#[test]
+fn refuses_ambiguous_socket2_discovery() {
+    let temp = tempfile::tempdir().unwrap();
+    for signature in ["one", "two"] {
+        let instance = temp.path().join("hypr").join(signature);
+        std::fs::create_dir_all(&instance).unwrap();
+        std::fs::write(instance.join(".socket2.sock"), "").unwrap();
+    }
+
+    let error = discover_socket2_path_with(temp.path(), |path| path.exists())
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("multiple socket2 sockets"));
 }

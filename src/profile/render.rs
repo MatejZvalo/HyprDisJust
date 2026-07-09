@@ -6,8 +6,16 @@ use crate::profile::store::{Profile, ProfileMonitor, ProfileOutput};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedMonitorRules {
+    pub mappings: Vec<RuleMapping>,
     pub rules: Vec<String>,
     pub batch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMapping {
+    pub monitor_id: String,
+    pub output_name: String,
+    pub rule: String,
 }
 
 pub fn render_monitor_rules(
@@ -19,7 +27,8 @@ pub fn render_monitor_rules(
     }
 
     let mut used_current = vec![false; current.len()];
-    let mut rules = Vec::with_capacity(profile.outputs.len());
+    let mut mappings = Vec::with_capacity(current.len().max(profile.outputs.len()));
+    let mut rules = Vec::with_capacity(current.len().max(profile.outputs.len()));
 
     for output in &profile.outputs {
         let current_output_name =
@@ -31,11 +40,35 @@ pub fn render_monitor_rules(
                     )
                 },
             )?;
-        rules.push(render_monitor_rule(&current_output_name, output)?);
+        let rule = render_monitor_rule(&current_output_name, output)?;
+        mappings.push(RuleMapping {
+            monitor_id: output.monitor_id.clone(),
+            output_name: current_output_name,
+            rule: rule.clone(),
+        });
+        rules.push(rule);
+    }
+
+    for (current_index, current_monitor) in current.iter().enumerate() {
+        if used_current[current_index] || !current_monitor.enabled {
+            continue;
+        }
+
+        let rule = render_disabled_monitor_rule(&current_monitor.output_name)?;
+        mappings.push(RuleMapping {
+            monitor_id: current_monitor.id.clone(),
+            output_name: current_monitor.output_name.clone(),
+            rule: rule.clone(),
+        });
+        rules.push(rule);
     }
 
     let batch = render_hyprctl_batch(&rules)?;
-    Ok(RenderedMonitorRules { rules, batch })
+    Ok(RenderedMonitorRules {
+        mappings,
+        rules,
+        batch,
+    })
 }
 
 pub fn render_hyprctl_batch(rules: &[String]) -> anyhow::Result<String> {
@@ -45,24 +78,11 @@ pub fn render_hyprctl_batch(rules: &[String]) -> anyhow::Result<String> {
 
     let mut commands = Vec::with_capacity(rules.len());
     for rule in rules {
-        let value = monitor_rule_value(rule)?;
-        commands.push(format!("keyword monitor {value}"));
+        validate_lua_monitor_call(rule)?;
+        commands.push(format!("eval {rule}"));
     }
 
     Ok(commands.join(" ; "))
-}
-
-pub fn render_hyprland_conf(rules: &[String]) -> anyhow::Result<String> {
-    if rules.is_empty() {
-        bail!("cannot render an empty Hyprland monitor config");
-    }
-
-    let mut lines = Vec::with_capacity(rules.len());
-    for rule in rules {
-        lines.push(format!("monitor = {}", monitor_rule_value(rule)?));
-    }
-
-    Ok(lines.join("\n"))
 }
 
 pub fn render_hyprland_lua(rules: &[String]) -> anyhow::Result<String> {
@@ -70,25 +90,24 @@ pub fn render_hyprland_lua(rules: &[String]) -> anyhow::Result<String> {
         bail!("cannot render an empty Hyprland monitor Lua config");
     }
 
-    let mut lines = Vec::with_capacity(rules.len());
     for rule in rules {
-        lines.push(format!(
-            "hyprland.keyword(\"monitor\", \"{}\")",
-            escape_lua_string(monitor_rule_value(rule)?)
-        ));
+        validate_lua_monitor_call(rule)?;
     }
 
-    Ok(lines.join("\n"))
+    Ok(rules.join("\n"))
 }
 
 pub fn format_hyprctl_batch_command(batch: &str) -> String {
     format!("hyprctl --batch \"{}\"", batch.replace('"', "\\\""))
 }
 
-fn monitor_rule_value(rule: &str) -> anyhow::Result<&str> {
-    validate_batch_component(rule, "monitor rule")?;
-    rule.strip_prefix("monitor ")
-        .with_context(|| format!("monitor rule `{rule}` must start with `monitor `"))
+fn validate_lua_monitor_call(rule: &str) -> anyhow::Result<()> {
+    validate_batch_component(rule, "monitor Lua call")?;
+    if !rule.starts_with("hl.monitor({ ") || !rule.ends_with(" })") {
+        bail!("monitor Lua call `{rule}` must be an hl.monitor table call");
+    }
+
+    Ok(())
 }
 
 fn resolve_current_output_name(
@@ -143,27 +162,34 @@ fn resolve_current_output_name(
     Ok(current[current_index].output_name.clone())
 }
 
+fn render_disabled_monitor_rule(output_name: &str) -> anyhow::Result<String> {
+    validate_batch_component(output_name, "output name")?;
+    Ok(format!(
+        "hl.monitor({{ output = \"{}\", disabled = true }})",
+        escape_lua_string(output_name)
+    ))
+}
+
 fn render_monitor_rule(output_name: &str, output: &ProfileOutput) -> anyhow::Result<String> {
     validate_batch_component(output_name, "output name")?;
 
     if !output.enabled {
-        return Ok(format!("monitor {output_name},disable"));
+        return render_disabled_monitor_rule(output_name);
     }
 
     validate_batch_component(&output.mode, "monitor mode")?;
-    let mut rule = format!(
-        "monitor {output_name},{},{}x{},{}",
-        output.mode,
-        output.x,
-        output.y,
-        format_number(output.scale)
-    );
+    let mut fields = vec![
+        format!("output = \"{}\"", escape_lua_string(output_name)),
+        format!("mode = \"{}\"", escape_lua_string(&output.mode)),
+        format!("position = \"{}x{}\"", output.x, output.y),
+        format!("scale = {}", format_number(output.scale)),
+    ];
 
     if output.transform != 0 {
-        rule.push_str(&format!(",transform,{}", output.transform));
+        fields.push(format!("transform = {}", output.transform));
     }
 
-    Ok(rule)
+    Ok(format!("hl.monitor({{ {} }})", fields.join(", ")))
 }
 
 fn validate_batch_component(value: &str, label: &str) -> anyhow::Result<()> {

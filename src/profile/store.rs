@@ -139,6 +139,35 @@ impl ProfileStore {
         Ok(name)
     }
 
+    pub fn save_profile(&mut self, mut profile: Profile, replace: bool) -> anyhow::Result<String> {
+        let name = validate_profile_name(&profile.name)?.to_owned();
+        profile.name = name.clone();
+
+        let existing_index = self
+            .profiles
+            .iter()
+            .position(|stored_profile| stored_profile.name == name);
+        if existing_index.is_some() && !replace {
+            bail!("profile `{name}` already exists; pass --replace to overwrite it");
+        }
+
+        let now = timestamp_now();
+        profile.updated_at = now.clone();
+        if let Some(index) = existing_index {
+            profile.created_at = self.profiles[index].created_at.clone();
+            self.profiles[index] = profile;
+        } else {
+            if profile.created_at.trim().is_empty() {
+                profile.created_at = now;
+            }
+            self.profiles.push(profile);
+        }
+
+        self.profiles
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(name)
+    }
+
     pub fn next_generated_name(&self, monitors: &[MonitorState]) -> String {
         let enabled_count = monitors.iter().filter(|monitor| monitor.enabled).count();
         let monitor_count = if enabled_count == 0 {
@@ -170,6 +199,70 @@ impl ProfileStore {
 
     pub fn has_profile(&self, name: &str) -> bool {
         self.profiles.iter().any(|profile| profile.name == name)
+    }
+
+    pub fn rename_profile(&mut self, old_name: &str, new_name: &str) -> anyhow::Result<()> {
+        let old_name = validate_profile_name(old_name)?;
+        let new_name = validate_profile_name(new_name)?;
+        if old_name == new_name {
+            bail!("profile `{old_name}` already has that name");
+        }
+        if self.has_profile(new_name) {
+            bail!("profile `{new_name}` already exists");
+        }
+
+        let Some(index) = self
+            .profiles
+            .iter()
+            .position(|profile| profile.name == old_name)
+        else {
+            bail!("profile `{old_name}` does not exist");
+        };
+
+        self.profiles[index].name = new_name.to_owned();
+        self.profiles[index].updated_at = timestamp_now();
+        self.profiles
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(())
+    }
+
+    pub fn delete_profile(&mut self, name: &str) -> anyhow::Result<Profile> {
+        let name = validate_profile_name(name)?;
+        let Some(index) = self
+            .profiles
+            .iter()
+            .position(|profile| profile.name == name)
+        else {
+            bail!("profile `{name}` does not exist");
+        };
+
+        Ok(self.profiles.remove(index))
+    }
+
+    pub fn copy_profile(
+        &mut self,
+        source_name: &str,
+        destination_name: &str,
+        replace: bool,
+    ) -> anyhow::Result<()> {
+        let source_name = validate_profile_name(source_name)?;
+        let destination_name = validate_profile_name(destination_name)?;
+        let Some(source) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.name == source_name)
+            .cloned()
+        else {
+            bail!("profile `{source_name}` does not exist");
+        };
+
+        let now = timestamp_now();
+        let mut profile = source;
+        profile.name = destination_name.to_owned();
+        profile.created_at = now.clone();
+        profile.updated_at = now;
+        self.save_profile(profile, replace)?;
+        Ok(())
     }
 }
 

@@ -61,10 +61,6 @@ fn config_paths_keep_generated_files_under_config_dir() {
         "/tmp/hyprdisjust-test/generated"
     );
     assert_eq!(
-        paths.generated_monitors_conf_path().to_string_lossy(),
-        "/tmp/hyprdisjust-test/generated/monitors.conf"
-    );
-    assert_eq!(
         paths.generated_monitors_lua_path().to_string_lossy(),
         "/tmp/hyprdisjust-test/generated/monitors.lua"
     );
@@ -149,4 +145,43 @@ fn saved_profile_outputs_keep_duplicate_no_serial_monitors_distinct() {
         profile.outputs[1].monitor_id,
         "acme:samepanel:no-serial:output:dp-2"
     );
+}
+
+#[test]
+fn profile_store_renames_deletes_and_copies_profiles() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+
+    store.rename_profile("desk", "work").unwrap();
+    assert!(store.has_profile("work"));
+    assert!(!store.has_profile("desk"));
+
+    store.copy_profile("work", "backup", false).unwrap();
+    assert!(store.has_profile("backup"));
+    assert_eq!(store.profiles.len(), 2);
+
+    let deleted = store.delete_profile("backup").unwrap();
+    assert_eq!(deleted.name, "backup");
+    assert_eq!(store.profiles.len(), 1);
+}
+
+#[test]
+fn profile_store_lifecycle_refuses_ambiguous_mutations() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    store
+        .save_current_profile(Some("laptop"), &monitors, false)
+        .unwrap();
+
+    assert!(store.rename_profile("desk", "laptop").is_err());
+    assert!(store.rename_profile("missing", "other").is_err());
+    assert!(store.copy_profile("missing", "other", false).is_err());
+    assert!(store.copy_profile("desk", "laptop", false).is_err());
+    assert!(store.delete_profile("missing").is_err());
 }

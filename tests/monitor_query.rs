@@ -40,6 +40,23 @@ const DUPLICATE_NO_SERIAL: &str = r#"[
   }
 ]"#;
 
+const MISSING_SCALE: &str = r#"[
+  {
+    "id": 0,
+    "name": "DP-1",
+    "description": "Acme Missing Scale",
+    "make": "Acme",
+    "model": "Missing Scale",
+    "serial": "123",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 0,
+    "y": 0,
+    "transform": 0
+  }
+]"#;
+
 #[test]
 fn active_laptop_fixture_parses() {
     let monitors = parse_monitors_output(LAPTOP).unwrap();
@@ -79,6 +96,13 @@ fn inactive_fixture_normalizes_enabled_false() {
     assert_eq!(monitors.len(), 1);
     assert!(!monitors[0].enabled);
     assert_eq!(monitors[0].x, -1920);
+}
+
+#[test]
+fn missing_scale_defaults_to_one() {
+    let monitors = parse_monitors_output(MISSING_SCALE).unwrap();
+
+    assert_eq!(monitors[0].scale, 1.0);
 }
 
 #[test]

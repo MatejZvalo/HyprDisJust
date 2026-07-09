@@ -22,7 +22,7 @@ pub struct RawHyprMonitor {
     pub refresh_rate: f64,
     pub x: i32,
     pub y: i32,
-    #[serde(default)]
+    #[serde(default = "default_scale")]
     pub scale: f64,
     #[serde(default)]
     pub transform: i32,
@@ -193,4 +193,8 @@ fn disambiguate_duplicate_monitor_ids(monitors: &mut [MonitorState]) {
 
 fn useful(value: &str) -> bool {
     !value.trim().is_empty() && slug_component(value) != "unknown"
+}
+
+fn default_scale() -> f64 {
+    1.0
 }

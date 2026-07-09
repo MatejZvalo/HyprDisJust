@@ -1,7 +1,11 @@
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
+use hyprdisjust::profile::store::ProfileStore;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -13,18 +17,266 @@ fn desk_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hyprctl-monitors-desk.json")
 }
 
+fn dock_renamed_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hyprctl-monitors-dock-renamed.json")
+}
+
 #[test]
 fn help_lists_bootstrap_command_surface() {
     let output = hyprdisjust().arg("--help").output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    for command in ["doctor", "list", "save", "apply", "daemon", "export"] {
+    for command in [
+        "doctor",
+        "list",
+        "save",
+        "rename",
+        "delete",
+        "copy",
+        "apply",
+        "daemon",
+        "export",
+        "tui",
+        "install-systemd-user",
+        "completions",
+    ] {
         assert!(
             stdout.contains(command),
             "expected help output to include `{command}`:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn completions_prints_shell_completion_script() {
+    let output = hyprdisjust()
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("complete -F _hyprdisjust"));
+    assert!(stdout.contains("install-systemd-user"));
+}
+
+#[test]
+fn profile_lifecycle_commands_rename_copy_and_delete() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let renamed = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .args(["rename", "desk", "work"])
+        .output()
+        .unwrap();
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+
+    let copied = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .args(["copy", "work", "backup"])
+        .output()
+        .unwrap();
+    assert!(
+        copied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+
+    let deleted = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .args(["delete", "backup", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+
+    let list = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .arg("list")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(list.stdout).unwrap();
+    assert!(stdout.contains("- work (2 monitors)"));
+    assert!(!stdout.contains("desk"));
+    assert!(!stdout.contains("backup"));
+}
+
+#[test]
+fn profile_lifecycle_reports_clear_failures() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let duplicate = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .args(["copy", "desk", "desk"])
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(String::from_utf8(duplicate.stderr)
+        .unwrap()
+        .contains("already exists"));
+
+    let delete_without_yes = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .args(["delete", "desk"])
+        .output()
+        .unwrap();
+    assert_eq!(delete_without_yes.status.code(), Some(1));
+    assert!(String::from_utf8(delete_without_yes.stderr)
+        .unwrap()
+        .contains("requires --yes"));
+}
+
+#[test]
+fn doctor_reports_paths_profiles_socket_and_stale_output_names() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", dock_renamed_fixture())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("HyprDisJust doctor"));
+    assert!(!stdout.contains("generated conf"));
+    assert!(stdout.contains("[info] generated lua:"));
+    assert!(stdout.contains("[warning] socket2:"));
+    assert!(stdout.contains("[ok] profiles: 1 saved"));
+    assert!(stdout.contains("[warning] saved output names:"));
+    assert!(stdout.contains("Hyprland: detected"));
+    assert!(stdout.contains("Best profile: desk"));
+}
+
+#[test]
+fn doctor_reports_empty_store_without_failing() {
+    let config_dir = tempdir().unwrap();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[warning] profiles: no profiles saved"));
+    assert!(stdout.contains("Monitors: 2"));
+}
+
+#[test]
+fn install_systemd_user_dry_run_prints_service() {
+    let systemd_dir = tempdir().unwrap();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_SYSTEMD_USER_DIR", systemd_dir.path())
+        .args(["install-systemd-user", "--dry-run", "--enable", "--start"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Would write systemd user service"));
+    assert!(stdout.contains("ExecStart="));
+    assert!(stdout.contains("hyprdisjust"));
+    assert!(!systemd_dir.path().join("hyprdisjust.service").exists());
+}
+
+#[test]
+fn install_systemd_user_can_enable_and_start_with_fake_systemctl() {
+    let systemd_dir = tempdir().unwrap();
+    let fake_bin = fake_systemctl();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_SYSTEMD_USER_DIR", systemd_dir.path())
+        .env("PATH", fake_bin.path())
+        .args(["install-systemd-user", "--enable", "--start"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let service = fs::read_to_string(systemd_dir.path().join("hyprdisjust.service")).unwrap();
+    assert!(service.contains("Restart=on-failure"));
+    let calls = fs::read_to_string(fake_bin.path().join("calls")).unwrap();
+    assert!(calls.contains("--user enable hyprdisjust.service"));
+    assert!(calls.contains("--user start hyprdisjust.service"));
+}
+
+#[test]
+fn tui_snapshot_uses_current_monitors_and_profiles() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .arg("tui")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("HyprDisJust TUI"));
+    assert!(stdout.contains("Previewing profile `desk`"));
+    assert!(stdout.contains("Monitors:"));
+    assert!(stdout.contains("DP-1 2560x1440@144"));
+    assert!(stdout.contains("* desk (2 monitors)"));
+    assert!(stdout.contains("Preview command:"));
+}
+
+#[test]
+fn tui_snapshot_reports_apply_plan_warnings() {
+    let config_dir = tempdir().unwrap();
+    save_overlapping_profile(config_dir.path(), "overlap");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .arg("tui")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Previewing profile `overlap` with 1 warning"));
+    assert!(stdout.contains("Warnings:"));
+    assert!(stdout.contains("overlap"));
 }
 
 #[test]
@@ -61,12 +313,12 @@ fn daemon_once_dry_run_explains_selected_profile() {
     assert!(stdout.contains("Confidence: exact"));
     assert!(stdout.contains("Dry run: monitor layout was not changed"));
     assert!(stdout.contains(
-        "hyprctl --batch \"keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1\""
+        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1 })\""
     ));
 }
 
 #[test]
-fn export_named_profile_writes_generated_conf() {
+fn export_rejects_conf_format() {
     let config_dir = tempdir().unwrap();
     save_desk_profile(config_dir.path(), "desk");
 
@@ -77,19 +329,10 @@ fn export_named_profile_writes_generated_conf() {
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let path = config_dir.path().join("generated").join("monitors.conf");
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        "monitor = DP-1,2560x1440@144,0x0,1\nmonitor = eDP-1,1920x1200@60,2560x240,1"
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Exported profile `desk` to "));
-    assert!(stdout.contains(&path.to_string_lossy().to_string()));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("invalid value 'conf'"));
 }
 
 #[test]
@@ -111,7 +354,7 @@ fn export_named_profile_writes_generated_lua() {
     );
     assert_eq!(
         fs::read_to_string(config_dir.path().join("generated").join("monitors.lua")).unwrap(),
-        "hyprland.keyword(\"monitor\", \"DP-1,2560x1440@144,0x0,1\")\nhyprland.keyword(\"monitor\", \"eDP-1,1920x1200@60,2560x240,1\")"
+        "hl.monitor({ output = \"DP-1\", mode = \"2560x1440@144\", position = \"0x0\", scale = 1 })\nhl.monitor({ output = \"eDP-1\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })"
     );
 }
 
@@ -123,7 +366,7 @@ fn export_without_name_auto_selects_best_match() {
     let output = hyprdisjust()
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
-        .args(["export", "--format", "conf"])
+        .args(["export", "--format", "lua"])
         .output()
         .unwrap();
 
@@ -133,9 +376,108 @@ fn export_without_name_auto_selects_best_match() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        fs::read_to_string(config_dir.path().join("generated").join("monitors.conf")).unwrap(),
-        "monitor = DP-1,2560x1440@144,0x0,1\nmonitor = eDP-1,1920x1200@60,2560x240,1"
+        fs::read_to_string(config_dir.path().join("generated").join("monitors.lua")).unwrap(),
+        "hl.monitor({ output = \"DP-1\", mode = \"2560x1440@144\", position = \"0x0\", scale = 1 })\nhl.monitor({ output = \"eDP-1\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })"
     );
+}
+
+#[test]
+fn export_reports_layout_warnings() {
+    let config_dir = tempdir().unwrap();
+    save_overlapping_profile(config_dir.path(), "overlap");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .args(["export", "overlap", "--format", "lua"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Warnings:"));
+    assert!(stdout.contains("overlap"));
+    assert!(stdout.contains("Exported profile `overlap`"));
+}
+
+#[test]
+fn apply_reports_warnings_before_live_apply_success() {
+    let config_dir = tempdir().unwrap();
+    save_overlapping_profile(config_dir.path(), "overlap");
+    let fake_bin = fake_hyprctl(0, "", "");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .env("PATH", fake_bin.path())
+        .args(["apply", "overlap"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let warning_index = stdout.find("Warnings:").expect("missing warnings");
+    let applied_index = stdout
+        .find("Applied profile `overlap`")
+        .expect("missing apply success");
+    assert!(
+        warning_index < applied_index,
+        "warnings should be printed before apply success:\n{stdout}"
+    );
+}
+
+#[test]
+fn apply_failure_preserves_hyprctl_stderr_details() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+    let fake_bin = fake_hyprctl(1, "", "synthetic hyprctl failure");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .env("PATH", fake_bin.path())
+        .args(["apply", "desk"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("failed to apply profile `desk`"));
+    assert!(stderr.contains("synthetic hyprctl failure"));
+    assert!(stderr.contains("Previous layout:"));
+}
+
+#[test]
+fn apply_failure_preserves_hyprctl_stdout_errors() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+    let fake_bin = fake_hyprctl(
+        0,
+        "keyword can't work with non-legacy parsers. Use eval.\n",
+        "",
+    );
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .env("PATH", fake_bin.path())
+        .args(["apply", "desk"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("failed to apply profile `desk`"));
+    assert!(stderr.contains("keyword can't work"));
+    assert!(stderr.contains("Previous layout:"));
 }
 
 #[test]
@@ -145,7 +487,7 @@ fn export_unknown_profile_returns_clear_error() {
     let output = hyprdisjust()
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
-        .args(["export", "missing", "--format", "conf"])
+        .args(["export", "missing", "--format", "lua"])
         .output()
         .unwrap();
 
@@ -264,4 +606,44 @@ fn save_desk_profile(config_dir: &std::path::Path, name: &str) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn save_overlapping_profile(config_dir: &std::path::Path, name: &str) {
+    let monitors =
+        parse_monitors_output(include_str!("fixtures/hyprctl-monitors-desk.json")).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some(name), &monitors, false)
+        .unwrap();
+    store.profiles[0].outputs[1].x = 100;
+    store.profiles[0].outputs[1].y = 0;
+    store.save_atomic(config_dir.join("profiles.toml")).unwrap();
+}
+
+fn fake_hyprctl(exit_code: i32, stdout: &str, stderr: &str) -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("hyprctl");
+    let mut script = fs::File::create(&path).unwrap();
+    writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "printf '%s' {:?}", stdout).unwrap();
+    writeln!(script, "printf '%s' {:?} >&2", stderr).unwrap();
+    writeln!(script, "exit {exit_code}").unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    dir
+}
+
+fn fake_systemctl() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("systemctl");
+    let calls = dir.path().join("calls");
+    let mut script = fs::File::create(&path).unwrap();
+    writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "printf '%s\\n' \"$*\" >> {:?}", calls).unwrap();
+    writeln!(script, "exit 0").unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    dir
 }

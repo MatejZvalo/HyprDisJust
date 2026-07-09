@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub debounce_ms: u64,
     #[serde(default)]
     pub apply_on_start: bool,
+    #[serde(default = "default_tui_move_step")]
+    pub tui_move_step: i32,
 }
 
 impl ConfigPaths {
@@ -61,10 +63,6 @@ impl ConfigPaths {
 
     pub fn generated_dir_path(&self) -> PathBuf {
         self.config_dir.join("generated")
-    }
-
-    pub fn generated_monitors_conf_path(&self) -> PathBuf {
-        self.generated_dir_path().join("monitors.conf")
     }
 
     pub fn generated_monitors_lua_path(&self) -> PathBuf {
@@ -140,12 +138,17 @@ impl Default for AppConfig {
             fallback_profile: None,
             debounce_ms: default_debounce_ms(),
             apply_on_start: false,
+            tui_move_step: default_tui_move_step(),
         }
     }
 }
 
 fn default_debounce_ms() -> u64 {
     900
+}
+
+fn default_tui_move_step() -> i32 {
+    20
 }
 
 fn unique_temp_path(path: &Path) -> PathBuf {

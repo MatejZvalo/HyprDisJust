@@ -1,21 +1,22 @@
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::bail;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 
 use crate::config::{write_generated_file, AppConfig, ConfigPaths};
 use crate::daemon::{
     decide_auto_apply, format_auto_apply_decision, AutoApplyDecision, DaemonOptions,
 };
 use crate::hyprland::hyprctl::current_monitors;
-use crate::hyprland::hyprctl::HyprctlClient;
 use crate::hyprland::monitor::MonitorState;
+use crate::profile::apply::{apply_plan, plan_apply, ApplyPlan};
 use crate::profile::r#match::{best_profile_match, BestProfileMatch};
-use crate::profile::render::{
-    format_hyprctl_batch_command, render_hyprland_conf, render_hyprland_lua, render_monitor_rules,
-};
+use crate::profile::render::{format_hyprctl_batch_command, render_hyprland_lua};
 use crate::profile::store::Profile;
 use crate::profile::store::ProfileStore;
+use crate::systemd::{install_user_service, SystemdInstallOptions};
 
 #[derive(Debug, Parser)]
 #[command(name = "hyprdisjust")]
@@ -36,6 +37,31 @@ enum Commands {
         /// Profile name. A default name will be chosen later when omitted.
         name: Option<String>,
         /// Replace an existing profile with the same name.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Rename a saved profile.
+    Rename {
+        /// Existing profile name.
+        old: String,
+        /// New profile name.
+        new: String,
+    },
+    /// Delete a saved profile.
+    Delete {
+        /// Profile name to delete.
+        name: String,
+        /// Delete without an interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Copy a saved profile to a new name.
+    Copy {
+        /// Existing profile name.
+        source: String,
+        /// New profile name.
+        destination: String,
+        /// Replace an existing destination profile.
         #[arg(long)]
         replace: bool,
     },
@@ -70,11 +96,30 @@ enum Commands {
         #[arg(long, value_enum)]
         format: ExportFormat,
     },
+    /// Open the terminal profile editor.
+    Tui,
+    /// Install the HyprDisJust daemon as a systemd user service.
+    InstallSystemdUser {
+        /// Enable the user service after writing it.
+        #[arg(long)]
+        enable: bool,
+        /// Start the user service after writing it.
+        #[arg(long)]
+        start: bool,
+        /// Print the service that would be installed without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print shell completions.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExportFormat {
-    Conf,
     Lua,
 }
 
@@ -84,19 +129,8 @@ pub fn run() -> anyhow::Result<()> {
     match cli.command {
         Commands::Doctor => {
             let paths = ConfigPaths::resolve()?;
-            let monitors = current_monitors()?;
-            let store = ProfileStore::load(paths.profile_store_path())?;
-            let config = AppConfig::load(paths.config_file_path())?;
-            let mut output = format_doctor(&monitors);
-            if let Some(summary) = format_best_profile_summary(
-                &best_profile_match(&store, &monitors),
-                &store,
-                config.fallback_profile.as_deref(),
-            ) {
-                output.push_str("\n\n");
-                output.push_str(&summary);
-            }
-            println!("{output}");
+            let report = crate::doctor::build_doctor_report(&paths);
+            println!("{}", format_doctor_report(&report));
         }
         Commands::List => {
             let paths = ConfigPaths::resolve()?;
@@ -116,6 +150,13 @@ pub fn run() -> anyhow::Result<()> {
                 if monitors.len() == 1 { "" } else { "s" }
             );
         }
+        Commands::Rename { old, new } => run_rename(&old, &new)?,
+        Commands::Delete { name, yes } => run_delete(&name, yes)?,
+        Commands::Copy {
+            source,
+            destination,
+            replace,
+        } => run_copy(&source, &destination, replace)?,
         Commands::Apply {
             name,
             auto,
@@ -131,9 +172,77 @@ pub fn run() -> anyhow::Result<()> {
             log_file,
         })?,
         Commands::Export { name, format } => run_export(name.as_deref(), format)?,
+        Commands::Tui => run_tui()?,
+        Commands::InstallSystemdUser {
+            enable,
+            start,
+            dry_run,
+        } => run_install_systemd_user(enable, start, dry_run)?,
+        Commands::Completions { shell } => print!("{}", render_completions(shell)?),
     }
 
     Ok(())
+}
+
+fn run_rename(old: &str, new: &str) -> anyhow::Result<()> {
+    let paths = ConfigPaths::resolve()?;
+    let mut store = ProfileStore::load(paths.profile_store_path())?;
+    store.rename_profile(old, new)?;
+    store.save_atomic(paths.profile_store_path())?;
+    println!("Renamed profile `{old}` to `{new}`.");
+    Ok(())
+}
+
+fn run_delete(name: &str, yes: bool) -> anyhow::Result<()> {
+    if !yes && !confirm_delete(name)? {
+        println!("Delete cancelled.");
+        return Ok(());
+    }
+
+    let paths = ConfigPaths::resolve()?;
+    let mut store = ProfileStore::load(paths.profile_store_path())?;
+    store.delete_profile(name)?;
+    store.save_atomic(paths.profile_store_path())?;
+    println!("Deleted profile `{name}`.");
+    Ok(())
+}
+
+fn run_copy(source: &str, destination: &str, replace: bool) -> anyhow::Result<()> {
+    let paths = ConfigPaths::resolve()?;
+    let mut store = ProfileStore::load(paths.profile_store_path())?;
+    store.copy_profile(source, destination, replace)?;
+    store.save_atomic(paths.profile_store_path())?;
+    println!("Copied profile `{source}` to `{destination}`.");
+    Ok(())
+}
+
+fn confirm_delete(name: &str) -> anyhow::Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!("delete requires --yes when stdin is not an interactive terminal");
+    }
+
+    print!("Delete profile `{name}`? type `yes` to confirm: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim() == "yes")
+}
+
+fn run_tui() -> anyhow::Result<()> {
+    let paths = ConfigPaths::resolve()?;
+    let store = ProfileStore::load(paths.profile_store_path())?;
+    let monitors = current_monitors()?;
+    let config = AppConfig::load(paths.config_file_path())?;
+
+    if std::io::stdout().is_terminal() {
+        let app = crate::tui::TuiApp::new(store, paths, config, monitors)?;
+        crate::tui::run(app)
+    } else {
+        let model =
+            crate::tui::initial_model(&store, &monitors, config.fallback_profile.as_deref())?;
+        println!("{}", crate::tui::format_snapshot(&model));
+        Ok(())
+    }
 }
 
 fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()> {
@@ -147,8 +256,8 @@ fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()
     if let Some(name) = name {
         let profile = profile_by_name(&store, name)?;
         let monitors = current_monitors()?;
-        let rendered = render_monitor_rules(profile, &monitors)?;
-        apply_or_print(profile, &rendered.batch, &monitors, dry_run)?;
+        let plan = plan_apply(profile, &monitors)?;
+        apply_or_print(&plan, &monitors, dry_run)?;
         return Ok(());
     }
 
@@ -166,9 +275,9 @@ fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()
         let decision = decide_auto_apply(&store, &best_match, config.fallback_profile.as_deref());
         if let Some(profile_name) = decision.profile_name() {
             let profile = profile_by_name(&store, profile_name)?;
-            let rendered = render_monitor_rules(profile, &monitors)?;
+            let plan = plan_apply(profile, &monitors)?;
             output.push_str("\n\n");
-            output.push_str(&format_apply_commands(profile, &rendered.batch));
+            output.push_str(&format_apply_commands(&plan));
         } else {
             output.push_str("\n\nCommands: none");
         }
@@ -177,8 +286,8 @@ fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()
     }
 
     let profile = require_auto_profile(&store, &best_match, config.fallback_profile.as_deref())?;
-    let rendered = render_monitor_rules(profile, &monitors)?;
-    apply_or_print(profile, &rendered.batch, &monitors, dry_run)
+    let plan = plan_apply(profile, &monitors)?;
+    apply_or_print(&plan, &monitors, dry_run)
 }
 
 fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
@@ -195,20 +304,44 @@ fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
         }
     };
 
-    let rendered = render_monitor_rules(profile, &monitors)?;
-    let (path, contents) = match format {
-        ExportFormat::Conf => (
-            paths.generated_monitors_conf_path(),
-            render_hyprland_conf(&rendered.rules)?,
-        ),
-        ExportFormat::Lua => (
-            paths.generated_monitors_lua_path(),
-            render_hyprland_lua(&rendered.rules)?,
-        ),
+    let plan = plan_apply(profile, &monitors)?;
+    print_apply_warnings(&plan);
+    let path = match format {
+        ExportFormat::Lua => paths.generated_monitors_lua_path(),
     };
+    let contents = render_hyprland_lua(&plan.rules)?;
 
     write_generated_file(&path, &contents)?;
     println!("Exported profile `{}` to {}.", profile.name, path.display());
+    Ok(())
+}
+
+fn run_install_systemd_user(enable: bool, start: bool, dry_run: bool) -> anyhow::Result<()> {
+    let result = install_user_service(&SystemdInstallOptions {
+        enable,
+        start,
+        dry_run,
+    })?;
+
+    if dry_run {
+        println!(
+            "Would write systemd user service to {}:\n{}",
+            result.service_path.display(),
+            result.service_contents
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Installed systemd user service at {}.",
+        result.service_path.display()
+    );
+    if result.enabled {
+        println!("Enabled hyprdisjust.service.");
+    }
+    if result.started {
+        println!("Started hyprdisjust.service.");
+    }
     Ok(())
 }
 
@@ -242,39 +375,59 @@ fn require_auto_profile<'a>(
 }
 
 fn apply_or_print(
-    profile: &Profile,
-    batch: &str,
+    plan: &ApplyPlan,
     previous_monitors: &[MonitorState],
     dry_run: bool,
 ) -> anyhow::Result<()> {
     if dry_run {
-        println!("{}", format_apply_commands(profile, batch));
+        println!("{}", format_apply_commands(plan));
         return Ok(());
     }
 
-    let client = HyprctlClient;
-    if let Err(error) = client.apply_monitor_batch(batch) {
+    print_apply_warnings(plan);
+
+    if let Err(error) = apply_plan(plan) {
         bail!(
-            "{error}\nPrevious layout:\n{}",
+            "{error:#}\nPrevious layout:\n{}",
             format_doctor(previous_monitors)
         );
     }
 
     println!(
         "Applied profile `{}` with {} monitor rule{}.",
-        profile.name,
-        profile.outputs.len(),
-        if profile.outputs.len() == 1 { "" } else { "s" }
+        plan.profile_name,
+        plan.rules.len(),
+        if plan.rules.len() == 1 { "" } else { "s" }
     );
     Ok(())
 }
 
-fn format_apply_commands(profile: &Profile, batch: &str) -> String {
-    format!(
+fn format_apply_commands(plan: &ApplyPlan) -> String {
+    let mut output = format!(
         "Profile: {}\nCommand:\n{}",
-        profile.name,
-        format_hyprctl_batch_command(batch)
-    )
+        plan.profile_name,
+        format_hyprctl_batch_command(&plan.batch)
+    );
+    if !plan.warnings.is_empty() {
+        output.push('\n');
+        output.push_str(&format_apply_warnings(plan));
+    }
+    output
+}
+
+fn print_apply_warnings(plan: &ApplyPlan) {
+    if !plan.warnings.is_empty() {
+        println!("{}", format_apply_warnings(plan));
+    }
+}
+
+fn format_apply_warnings(plan: &ApplyPlan) -> String {
+    let mut output = "Warnings:".to_owned();
+    for warning in &plan.warnings {
+        output.push_str("\n- ");
+        output.push_str(&warning.message());
+    }
+    output
 }
 
 pub fn format_auto_apply_dry_run(
@@ -338,6 +491,42 @@ pub fn format_profile_list(store: &ProfileStore) -> String {
     output
 }
 
+pub fn format_doctor_report(report: &crate::doctor::DoctorReport) -> String {
+    let mut output = "HyprDisJust doctor".to_owned();
+    output.push_str("\n\nChecks:");
+    for check in &report.checks {
+        output.push_str(&format!(
+            "\n[{}] {}: {}",
+            format_doctor_severity(check.severity),
+            check.label,
+            check.message
+        ));
+    }
+
+    output.push_str("\n\n");
+    if report.monitors.is_empty() {
+        output.push_str("Hyprland: not detected\nMonitors: 0");
+    } else {
+        output.push_str(&format_doctor(&report.monitors));
+    }
+
+    if let Some(summary) = &report.best_profile_summary {
+        output.push_str("\n\n");
+        output.push_str(summary);
+    }
+
+    output
+}
+
+fn format_doctor_severity(severity: crate::doctor::DoctorSeverity) -> &'static str {
+    match severity {
+        crate::doctor::DoctorSeverity::Ok => "ok",
+        crate::doctor::DoctorSeverity::Info => "info",
+        crate::doctor::DoctorSeverity::Warning => "warning",
+        crate::doctor::DoctorSeverity::Error => "error",
+    }
+}
+
 pub fn format_doctor(monitors: &[MonitorState]) -> String {
     let mut output = format!("Hyprland: detected\nMonitors: {}", monitors.len());
 
@@ -372,4 +561,11 @@ fn format_number(value: f64) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_owned()
+}
+
+fn render_completions(shell: Shell) -> anyhow::Result<String> {
+    let mut command = Cli::command();
+    let mut output = Vec::new();
+    generate(shell, &mut command, "hyprdisjust", &mut output);
+    Ok(String::from_utf8(output)?)
 }

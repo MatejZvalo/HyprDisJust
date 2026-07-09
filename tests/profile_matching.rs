@@ -367,6 +367,7 @@ fn app_config_loads_optional_fallback_profile() {
     assert_eq!(config.fallback_profile.as_deref(), Some("laptop"));
     assert_eq!(config.debounce_ms, 900);
     assert!(!config.apply_on_start);
+    assert_eq!(config.tui_move_step, 20);
 }
 
 #[test]
@@ -375,7 +376,7 @@ fn app_config_loads_daemon_fields() {
     let config_path = temp.path().join("config.toml");
     fs::write(
         &config_path,
-        "fallback_profile = \"laptop\"\ndebounce_ms = 1250\napply_on_start = true\n",
+        "fallback_profile = \"laptop\"\ndebounce_ms = 1250\napply_on_start = true\ntui_move_step = 80\n",
     )
     .unwrap();
 
@@ -384,6 +385,7 @@ fn app_config_loads_daemon_fields() {
     assert_eq!(config.fallback_profile.as_deref(), Some("laptop"));
     assert_eq!(config.debounce_ms, 1250);
     assert!(config.apply_on_start);
+    assert_eq!(config.tui_move_step, 80);
 }
 
 #[test]
@@ -394,6 +396,7 @@ fn missing_app_config_loads_defaults() {
     assert_eq!(config, AppConfig::default());
     assert_eq!(config.debounce_ms, 900);
     assert!(!config.apply_on_start);
+    assert_eq!(config.tui_move_step, 20);
 }
 
 #[test]
@@ -452,7 +455,7 @@ fn apply_auto_dry_run_explains_selected_profile() {
     assert!(stdout.contains("Would select profile: desk"));
     assert!(stdout.contains("Confidence: exact"));
     assert!(stdout.contains(
-        "hyprctl --batch \"keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1\""
+        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1 })\""
     ));
 }
 
@@ -476,7 +479,7 @@ fn apply_named_dry_run_prints_exact_hyprctl_batch() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Profile: desk"));
     assert!(stdout.contains(
-        "hyprctl --batch \"keyword monitor DP-1,2560x1440@144,0x0,1 ; keyword monitor eDP-1,1920x1200@60,2560x240,1\""
+        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1 })\""
     ));
 }
 

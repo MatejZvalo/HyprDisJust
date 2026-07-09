@@ -7,10 +7,12 @@ use std::time::Duration;
 use anyhow::Context;
 
 use crate::config::{AppConfig, ConfigPaths};
-use crate::hyprland::hyprctl::{current_monitors, HyprctlClient};
+use crate::hyprland::hyprctl::current_monitors;
 use crate::hyprland::ipc::Socket2EventReader;
+use crate::hyprland::monitor::MonitorState;
+use crate::profile::apply::{apply_plan, plan_apply};
 use crate::profile::r#match::{best_profile_match, BestProfileMatch};
-use crate::profile::render::{format_hyprctl_batch_command, render_monitor_rules};
+use crate::profile::render::format_hyprctl_batch_command;
 use crate::profile::store::{Profile, ProfileStore};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -250,35 +252,38 @@ fn run_once_with_paths(
     };
 
     let profile = profile_by_name(&store, profile_name)?;
-    let rendered = render_monitor_rules(profile, &monitors)?;
+    let plan = plan_apply(profile, &monitors)?;
     logger.log(&format!(
         "Command: {}",
-        format_hyprctl_batch_command(&rendered.batch)
+        format_hyprctl_batch_command(&plan.batch)
     ))?;
+    log_apply_warnings(&plan.warnings, logger)?;
 
     if dry_run {
         logger.log("Dry run: monitor layout was not changed")?;
         return Ok(AutoApplyRun {
             decision,
-            batch: Some(rendered.batch),
+            batch: Some(plan.batch),
             applied: false,
         });
     }
 
-    let client = HyprctlClient;
-    client
-        .apply_monitor_batch(&rendered.batch)
-        .with_context(|| format!("failed to apply profile `{}`", profile.name))?;
+    if let Err(error) = apply_plan(&plan) {
+        anyhow::bail!(
+            "{error:#}\nPrevious layout:\n{}",
+            format_previous_layout(&monitors)
+        );
+    }
     logger.log(&format!(
         "Applied profile `{}` with {} monitor rule{}",
-        profile.name,
-        profile.outputs.len(),
-        if profile.outputs.len() == 1 { "" } else { "s" }
+        plan.profile_name,
+        plan.rules.len(),
+        if plan.rules.len() == 1 { "" } else { "s" }
     ))?;
 
     Ok(AutoApplyRun {
         decision,
-        batch: Some(rendered.batch),
+        batch: Some(plan.batch),
         applied: true,
     })
 }
@@ -319,6 +324,47 @@ fn first_reason(reasons: &[String], fallback: &str) -> String {
         .first()
         .map(String::as_str)
         .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn log_apply_warnings(
+    warnings: &[crate::profile::apply::ApplyWarning],
+    logger: &mut DaemonLogger,
+) -> anyhow::Result<()> {
+    for warning in warnings {
+        logger.log(&format!("Warning: {}", warning.message()))?;
+    }
+
+    Ok(())
+}
+
+fn format_previous_layout(monitors: &[MonitorState]) -> String {
+    let mut output = format!("Monitors: {}", monitors.len());
+    for monitor in monitors {
+        output.push_str(&format!(
+            "\n- {} {}x{}@{} at {}x{} scale {}",
+            monitor.output_name,
+            monitor.width,
+            monitor.height,
+            format_number(monitor.refresh_rate),
+            monitor.x,
+            monitor.y,
+            format_number(monitor.scale)
+        ));
+    }
+
+    output
+}
+
+fn format_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        return format!("{value:.0}");
+    }
+
+    let formatted = format!("{value:.3}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
         .to_owned()
 }
 
