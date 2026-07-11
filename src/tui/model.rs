@@ -1,10 +1,10 @@
 use anyhow::{bail, Context};
 
 use crate::config::{AppConfig, ConfigPaths};
-use crate::daemon::{decide_auto_apply, AutoApplyDecision};
+use crate::daemon::{decide_auto_apply, format_auto_apply_decision, AutoApplyDecision};
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::apply::{plan_apply, ApplyPlan};
-use crate::profile::r#match::best_profile_match;
+use crate::profile::apply::{ensure_plan_safe_to_apply, plan_apply, ApplyPlan};
+use crate::profile::r#match::{best_profile_match, resolve_monitor_matches};
 use crate::profile::store::{Profile, ProfileMonitor, ProfileOutput, ProfileStore};
 
 use super::geometry::{move_output, snap_output, SnapDirection};
@@ -37,6 +37,14 @@ pub enum TuiInputMode {
     RenameProfile {
         name: String,
     },
+    CopyProfile {
+        source: String,
+        name: String,
+    },
+    ConfirmCopyReplace {
+        source: String,
+        name: String,
+    },
     ConfirmDelete {
         name: String,
     },
@@ -49,6 +57,7 @@ pub enum TuiInputMode {
         targets: Vec<usize>,
         cursor: usize,
     },
+    Help,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +83,7 @@ pub enum TuiAction {
     NewDraft,
     BeginSaveAs,
     BeginRename,
+    BeginCopy,
     BeginDelete,
     SaveNameChar(char),
     SaveNameBackspace,
@@ -82,18 +92,23 @@ pub enum TuiAction {
     Confirm,
     RequestQuit,
     ApplyDraft,
+    RefreshMonitors,
+    AutoSelect,
+    ShowHelp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TuiEffect {
     None,
     Apply(ApplyPlan),
+    RefreshMonitors,
     Quit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TuiModel {
     pub monitors: Vec<TuiMonitorRow>,
+    pub current_monitors: Vec<TuiCurrentMonitorRow>,
     pub profiles: Vec<TuiProfileRow>,
     pub selected_profile: Option<String>,
     pub selected_monitor: Option<String>,
@@ -114,6 +129,13 @@ pub struct TuiMonitorRow {
     pub transform: i32,
     pub enabled: bool,
     pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiCurrentMonitorRow {
+    pub output_name: String,
+    pub id: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +206,15 @@ impl TuiApp {
                         output,
                         Some(index) == self.selected_monitor_index,
                     )
+                })
+                .collect(),
+            current_monitors: self
+                .monitors
+                .iter()
+                .map(|monitor| TuiCurrentMonitorRow {
+                    output_name: monitor.output_name.clone(),
+                    id: monitor.id.clone(),
+                    enabled: monitor.enabled,
                 })
                 .collect(),
             profiles: self
@@ -300,6 +331,52 @@ impl TuiApp {
                 }
                 _ => Ok(TuiEffect::None),
             },
+            TuiInputMode::CopyProfile { source, mut name } => match action {
+                TuiAction::SaveNameChar(character) => {
+                    if !character.is_control() {
+                        name.push(character);
+                    }
+                    self.input_mode = TuiInputMode::CopyProfile { source, name };
+                    Ok(TuiEffect::None)
+                }
+                TuiAction::SaveNameBackspace => {
+                    name.pop();
+                    self.input_mode = TuiInputMode::CopyProfile { source, name };
+                    Ok(TuiEffect::None)
+                }
+                TuiAction::Submit => {
+                    let name = name.trim().to_owned();
+                    if name.is_empty() {
+                        self.status = "Profile name must not be empty".to_owned();
+                        self.input_mode = TuiInputMode::CopyProfile { source, name };
+                    } else if self.store.has_profile(&name) {
+                        self.status =
+                            format!("Replace profile `{name}` with the copy? press y to confirm");
+                        self.input_mode = TuiInputMode::ConfirmCopyReplace { source, name };
+                    } else {
+                        self.copy_profile_named(&source, &name, false)?;
+                    }
+                    Ok(TuiEffect::None)
+                }
+                TuiAction::Cancel | TuiAction::RequestQuit => {
+                    self.input_mode = TuiInputMode::Normal;
+                    self.status = "Copy cancelled".to_owned();
+                    Ok(TuiEffect::None)
+                }
+                _ => Ok(TuiEffect::None),
+            },
+            TuiInputMode::ConfirmCopyReplace { source, name } => match action {
+                TuiAction::Confirm | TuiAction::Submit => {
+                    self.copy_profile_named(&source, &name, true)?;
+                    Ok(TuiEffect::None)
+                }
+                TuiAction::Cancel | TuiAction::RequestQuit => {
+                    self.input_mode = TuiInputMode::Normal;
+                    self.status = "Copy replace cancelled".to_owned();
+                    Ok(TuiEffect::None)
+                }
+                _ => Ok(TuiEffect::None),
+            },
             TuiInputMode::ConfirmDelete { name } => match action {
                 TuiAction::Confirm | TuiAction::Submit => {
                     self.delete_profile_named(&name)?;
@@ -395,6 +472,17 @@ impl TuiApp {
                 }
                 _ => Ok(TuiEffect::None),
             },
+            TuiInputMode::Help => match action {
+                TuiAction::Cancel
+                | TuiAction::RequestQuit
+                | TuiAction::ShowHelp
+                | TuiAction::Submit => {
+                    self.input_mode = TuiInputMode::Normal;
+                    self.refresh_status();
+                    Ok(TuiEffect::None)
+                }
+                _ => Ok(TuiEffect::None),
+            },
         }
     }
 
@@ -408,6 +496,31 @@ impl TuiApp {
 
     pub fn mark_apply_failed(&mut self, error: &anyhow::Error) {
         self.status = format!("Apply failed: {error:#}");
+    }
+
+    pub fn mark_action_failed(&mut self, error: &anyhow::Error) {
+        self.status = format!("Action failed: {error:#}");
+    }
+
+    pub fn mark_noop(&mut self) {
+        self.status = format!("No changes: draft `{}` is already active", self.draft.name);
+    }
+
+    pub fn update_monitors(&mut self, monitors: Vec<MonitorState>) {
+        self.monitors = monitors;
+        if self.selected_profile_index.is_none() && !self.dirty {
+            self.draft = draft_from_current(&self.store, &self.monitors);
+            self.selected_monitor_index = first_selectable_monitor(&self.draft);
+        }
+        self.status = format!(
+            "Refreshed {} current monitor{}",
+            self.monitors.len(),
+            if self.monitors.len() == 1 { "" } else { "s" }
+        );
+    }
+
+    pub fn mark_refresh_failed(&mut self, error: &anyhow::Error) {
+        self.status = format!("Refresh failed: {error:#}");
     }
 
     fn handle_normal_action(&mut self, action: TuiAction) -> anyhow::Result<TuiEffect> {
@@ -437,7 +550,14 @@ impl TuiApp {
                 self.status = "Save as: edit name and press Enter".to_owned();
             }
             TuiAction::BeginRename => self.begin_rename(),
+            TuiAction::BeginCopy => self.begin_copy(),
             TuiAction::BeginDelete => self.begin_delete(),
+            TuiAction::RefreshMonitors => return Ok(TuiEffect::RefreshMonitors),
+            TuiAction::AutoSelect => self.select_automatic_profile(),
+            TuiAction::ShowHelp => {
+                self.input_mode = TuiInputMode::Help;
+                self.status = "Help".to_owned();
+            }
             TuiAction::RequestQuit => {
                 if self.dirty {
                     self.input_mode = TuiInputMode::ConfirmQuit;
@@ -446,7 +566,10 @@ impl TuiApp {
                     return Ok(TuiEffect::Quit);
                 }
             }
-            TuiAction::ApplyDraft => return self.request_apply(),
+            TuiAction::ApplyDraft => match self.request_apply() {
+                Ok(effect) => return Ok(effect),
+                Err(error) => self.status = format!("Draft cannot be applied: {error:#}"),
+            },
             _ => {}
         }
 
@@ -454,6 +577,10 @@ impl TuiApp {
     }
 
     fn new_draft_from_current(&mut self) {
+        if self.dirty {
+            self.status = "Save or discard the modified draft before creating another".to_owned();
+            return;
+        }
         self.selected_profile_index = None;
         self.draft = draft_from_current(&self.store, &self.monitors);
         self.selected_monitor_index = first_selectable_monitor(&self.draft);
@@ -463,6 +590,10 @@ impl TuiApp {
     }
 
     fn select_profile(&mut self, index: usize) {
+        if self.dirty {
+            self.status = "Save the modified draft or quit before switching profiles".to_owned();
+            return;
+        }
         if let Some(profile) = self.store.profiles.get(index).cloned() {
             self.selected_profile_index = Some(index);
             self.draft = profile;
@@ -580,9 +711,18 @@ impl TuiApp {
             return;
         };
         let modes = self
+            .draft
             .monitors
             .iter()
             .find(|monitor| monitor.id == output.monitor_id)
+            .and_then(|monitor| {
+                resolve_monitor_matches(std::slice::from_ref(monitor), &self.monitors)
+                    .into_iter()
+                    .next()
+                    .flatten()
+            })
+            .filter(|resolved| !resolved.ambiguous)
+            .and_then(|resolved| self.monitors.get(resolved.current_index))
             .map(|monitor| monitor.available_modes.clone())
             .unwrap_or_default();
         if modes.is_empty() {
@@ -604,12 +744,7 @@ impl TuiApp {
             return;
         };
         if let Some(output) = self.draft.outputs.get_mut(index) {
-            output.transform = match output.transform {
-                0 => 1,
-                1 => 2,
-                2 => 3,
-                _ => 0,
-            };
+            output.transform = (output.transform + 1).rem_euclid(8);
             self.mark_dirty("Changed selected monitor transform".to_owned());
         }
     }
@@ -653,6 +788,10 @@ impl TuiApp {
     }
 
     fn begin_rename(&mut self) {
+        if self.dirty {
+            self.status = "Save or discard the modified draft before renaming".to_owned();
+            return;
+        }
         let Some(name) = self
             .selected_profile_index
             .and_then(|index| self.store.profiles.get(index))
@@ -667,6 +806,10 @@ impl TuiApp {
     }
 
     fn begin_delete(&mut self) {
+        if self.dirty {
+            self.status = "Save or discard the modified draft before deleting".to_owned();
+            return;
+        }
         let Some(name) = self
             .selected_profile_index
             .and_then(|index| self.store.profiles.get(index))
@@ -678,6 +821,24 @@ impl TuiApp {
 
         self.input_mode = TuiInputMode::ConfirmDelete { name: name.clone() };
         self.status = format!("Delete profile `{name}`? press y to confirm");
+    }
+
+    fn begin_copy(&mut self) {
+        if self.dirty {
+            self.status = "Save or discard the modified draft before copying".to_owned();
+            return;
+        }
+        let Some(source) = self
+            .selected_profile_index
+            .and_then(|index| self.store.profiles.get(index))
+            .map(|profile| profile.name.clone())
+        else {
+            self.status = "Select a saved profile before copying".to_owned();
+            return;
+        };
+        let name = next_copy_name(&self.store, &source);
+        self.input_mode = TuiInputMode::CopyProfile { source, name };
+        self.status = "Copy profile: edit destination and press Enter".to_owned();
     }
 
     fn rename_selected_profile(&mut self, new_name: &str) -> anyhow::Result<()> {
@@ -737,6 +898,63 @@ impl TuiApp {
         Ok(())
     }
 
+    fn copy_profile_named(
+        &mut self,
+        source: &str,
+        destination: &str,
+        replace: bool,
+    ) -> anyhow::Result<()> {
+        self.store.copy_profile(source, destination, replace)?;
+        self.store
+            .save_atomic(self.paths.profile_store_path())
+            .with_context(|| {
+                format!(
+                    "failed to save profile store at {}",
+                    self.paths.profile_store_path().display()
+                )
+            })?;
+        self.selected_profile_index = self
+            .store
+            .profiles
+            .iter()
+            .position(|profile| profile.name == destination);
+        self.draft = self
+            .selected_profile_index
+            .and_then(|index| self.store.profiles.get(index).cloned())
+            .ok_or_else(|| anyhow::anyhow!("copied profile `{destination}` was not reloaded"))?;
+        self.selected_monitor_index = first_selectable_monitor(&self.draft);
+        self.dirty = false;
+        self.input_mode = TuiInputMode::Normal;
+        self.status = format!("Copied profile `{source}` to `{destination}`");
+        Ok(())
+    }
+
+    fn select_automatic_profile(&mut self) {
+        if self.dirty {
+            self.status =
+                "Automatic selection blocked: save or discard the modified draft first".to_owned();
+            return;
+        }
+        let best_match = best_profile_match(&self.store, &self.monitors);
+        let decision = decide_auto_apply(
+            &self.store,
+            &best_match,
+            self.config.fallback_profile.as_deref(),
+        );
+        if let Some(profile_name) = decision.profile_name() {
+            if let Some(index) = self
+                .store
+                .profiles
+                .iter()
+                .position(|profile| profile.name == profile_name)
+            {
+                self.select_profile(index);
+            }
+        }
+        self.status =
+            format_auto_apply_decision(&decision, "Automatic selection").replace('\n', " | ");
+    }
+
     fn apply_selected_mode(&mut self, modes: &[String], cursor: usize) {
         let Some(index) = self.selected_monitor_index else {
             return;
@@ -752,6 +970,7 @@ impl TuiApp {
 
     fn request_apply(&mut self) -> anyhow::Result<TuiEffect> {
         let plan = self.draft_apply_plan()?;
+        ensure_plan_safe_to_apply(&plan)?;
         if plan.warnings.is_empty() {
             return Ok(TuiEffect::Apply(plan));
         }
@@ -825,6 +1044,20 @@ fn draft_from_current(store: &ProfileStore, monitors: &[MonitorState]) -> Profil
         String::new(),
         String::new(),
     )
+}
+
+fn next_copy_name(store: &ProfileStore, source: &str) -> String {
+    let base = format!("{source}-copy");
+    if !store.has_profile(&base) {
+        return base;
+    }
+    for suffix in 2.. {
+        let candidate = format!("{base}-{suffix}");
+        if !store.has_profile(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("infinite suffix search should find a copy name")
 }
 
 fn first_selectable_monitor(profile: &Profile) -> Option<usize> {

@@ -17,15 +17,16 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use crate::hyprland::hyprctl::current_monitors;
 use crate::profile::apply::apply_plan;
 
 use self::geometry::{output_rect, CanvasTransform, SnapDirection};
 pub use self::model::{
-    initial_model, require_draft_plan, TuiAction, TuiApp, TuiEffect, TuiInputMode, TuiModel,
-    TuiMonitorRow, TuiProfileRow,
+    initial_model, require_draft_plan, TuiAction, TuiApp, TuiCurrentMonitorRow, TuiEffect,
+    TuiInputMode, TuiModel, TuiMonitorRow, TuiProfileRow,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -37,11 +38,21 @@ struct TuiLayout {
 pub fn run(mut app: TuiApp) -> anyhow::Result<()> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        let _ = disable_raw_mode();
+        return Err(error).context("failed to enter alternate screen");
+    }
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error).context("failed to initialize terminal");
+        }
+    };
     let run_result = run_loop(&mut terminal, &mut app);
     let restore_result = restore_terminal(&mut terminal);
 
@@ -69,15 +80,19 @@ fn run_loop(
                 let Some(action) = key_to_action(key, &app.input_mode) else {
                     continue;
                 };
-                if handle_effect(app, action)? {
-                    return Ok(());
+                match handle_effect(app, action) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => app.mark_action_failed(&error),
                 }
             }
             Event::Mouse(mouse) => {
                 let area = terminal.size().context("failed to read terminal size")?;
                 let layout = layout_areas(area.into());
-                if handle_mouse(app, mouse, layout, &mut drag_last)? {
-                    return Ok(());
+                match handle_mouse(app, mouse, layout, &mut drag_last) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => app.mark_action_failed(&error),
                 }
             }
             _ => {}
@@ -90,9 +105,20 @@ fn handle_effect(app: &mut TuiApp, action: TuiAction) -> anyhow::Result<bool> {
         TuiEffect::None => Ok(false),
         TuiEffect::Quit => Ok(true),
         TuiEffect::Apply(plan) => {
+            if plan.is_noop {
+                app.mark_noop();
+                return Ok(false);
+            }
             match apply_plan(&plan) {
                 Ok(()) => app.mark_applied(),
                 Err(error) => app.mark_apply_failed(&error),
+            }
+            Ok(false)
+        }
+        TuiEffect::RefreshMonitors => {
+            match current_monitors() {
+                Ok(monitors) => app.update_monitors(monitors),
+                Err(error) => app.mark_refresh_failed(&error),
             }
             Ok(false)
         }
@@ -195,6 +221,10 @@ pub fn render(frame: &mut Frame<'_>, model: &TuiModel) {
     frame.render_widget(preview_panel(model), lower[0]);
     frame.render_widget(warning_panel(model), lower[1]);
 
+    if model.input_mode == TuiInputMode::Help {
+        render_help(frame);
+    }
+
     debug_assert_eq!(layout.profile_list, body[0]);
     debug_assert_eq!(layout.canvas, editor[0]);
 }
@@ -241,6 +271,32 @@ fn title_line(model: &TuiModel) -> Line<'_> {
                 Span::raw("  Enter save  Esc cancel"),
             ])
         }
+        TuiInputMode::CopyProfile { source, name } => {
+            return Line::from(vec![
+                Span::styled(
+                    "HyprDisJust",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  copy `{source}` to: ")),
+                Span::styled(name.as_str(), Style::default().fg(Color::Yellow)),
+                Span::raw("  Enter copy  Esc cancel"),
+            ])
+        }
+        TuiInputMode::ConfirmCopyReplace { name, .. } => {
+            return Line::from(vec![
+                Span::styled(
+                    "HyprDisJust",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "  replace `{name}` with copy? y/Enter confirm  Esc cancel"
+                )),
+            ])
+        }
         TuiInputMode::ConfirmDelete { name } => {
             return Line::from(vec![
                 Span::styled(
@@ -257,6 +313,7 @@ fn title_line(model: &TuiModel) -> Line<'_> {
             "  choose snap target with Up/Down  Enter select  Esc cancel"
         }
         TuiInputMode::ConfirmQuit => "  discard changes? y/Enter confirm  Esc cancel",
+        TuiInputMode::Help => "  help  ?/Esc close",
     };
 
     Line::from(vec![
@@ -354,18 +411,19 @@ fn render_canvas(frame: &mut Frame<'_>, model: &TuiModel, area: Rect) {
 }
 
 fn details_panel(model: &TuiModel) -> Paragraph<'_> {
-    let text = model
+    let mut text = model
         .monitors
         .iter()
         .find(|monitor| monitor.selected)
         .map(|monitor| {
             format!(
-                "{}\nid: {}\nmode: {}  position: {}  scale: {}  status: {}",
+                "{}\nid: {}\nmode: {}  position: {}  scale: {}  transform: {}  status: {}",
                 monitor.output_name,
                 monitor.id,
                 monitor.mode,
                 monitor.position,
                 format_number(monitor.scale),
+                monitor.transform,
                 if monitor.enabled {
                     "enabled"
                 } else {
@@ -374,11 +432,31 @@ fn details_panel(model: &TuiModel) -> Paragraph<'_> {
             )
         })
         .unwrap_or_else(|| "No monitor selected".to_owned());
+    text.push_str("\ncurrent: ");
+    if model.current_monitors.is_empty() {
+        text.push_str("none");
+    } else {
+        text.push_str(
+            &model
+                .current_monitors
+                .iter()
+                .map(|monitor| {
+                    format!(
+                        "{} [{}] {}",
+                        monitor.output_name,
+                        if monitor.enabled { "on" } else { "off" },
+                        monitor.id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
 
     Paragraph::new(text)
         .block(
             Block::default()
-                .title("Selected Monitor")
+                .title("Selected Draft / Current Monitors")
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false })
@@ -411,8 +489,9 @@ fn warning_panel(model: &TuiModel) -> Paragraph<'_> {
         lines.push("No warnings.".to_owned());
     }
     lines.push(format!("move step: {}", model.move_step));
-    lines.push("n new  s save-as  R rename  d delete  a apply  space toggle".to_owned());
-    lines.push("m mode  r rotate  +/- scale  arrows move  H/J/K/L snap  q quit".to_owned());
+    lines.push("n new  s save-as  c copy  R rename  d delete  a apply  space toggle".to_owned());
+    lines.push("m mode  r rotate  +/- scale  arrows move  H/J/K/L snap  ? help".to_owned());
+    lines.push("f refresh  A auto-select  [/] profiles  Tab monitors  q quit".to_owned());
 
     Paragraph::new(lines.join("\n"))
         .block(
@@ -426,17 +505,36 @@ fn warning_panel(model: &TuiModel) -> Paragraph<'_> {
 pub fn format_snapshot(model: &TuiModel) -> String {
     let mut output = "HyprDisJust TUI\n".to_owned();
     output.push_str(&model.status);
+    output.push_str("\n\nCurrent monitors:");
+    if model.current_monitors.is_empty() {
+        output.push_str("\n- none");
+    } else {
+        for monitor in &model.current_monitors {
+            output.push_str(&format!(
+                "\n- {} [{}] id: {}",
+                monitor.output_name,
+                if monitor.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                monitor.id
+            ));
+        }
+    }
     output.push_str("\n\nMonitors:");
     if model.monitors.is_empty() {
         output.push_str("\n- none");
     } else {
         for monitor in &model.monitors {
             output.push_str(&format!(
-                "\n{} {} {} at {} ({})",
+                "\n{} {} {} at {} scale {} transform {} ({})",
                 if monitor.selected { "*" } else { "-" },
                 monitor.output_name,
                 monitor.mode,
                 monitor.position,
+                format_number(monitor.scale),
+                monitor.transform,
                 if monitor.enabled {
                     "enabled"
                 } else {
@@ -481,7 +579,9 @@ pub fn format_snapshot(model: &TuiModel) -> String {
 
 fn key_to_action(key: KeyEvent, input_mode: &TuiInputMode) -> Option<TuiAction> {
     match input_mode {
-        TuiInputMode::SaveAs { .. } | TuiInputMode::RenameProfile { .. } => match key.code {
+        TuiInputMode::SaveAs { .. }
+        | TuiInputMode::RenameProfile { .. }
+        | TuiInputMode::CopyProfile { .. } => match key.code {
             KeyCode::Enter => Some(TuiAction::Submit),
             KeyCode::Esc => Some(TuiAction::Cancel),
             KeyCode::Backspace => Some(TuiAction::SaveNameBackspace),
@@ -491,6 +591,7 @@ fn key_to_action(key: KeyEvent, input_mode: &TuiInputMode) -> Option<TuiAction> 
         TuiInputMode::ConfirmReplace { .. }
         | TuiInputMode::ConfirmQuit
         | TuiInputMode::ConfirmApply
+        | TuiInputMode::ConfirmCopyReplace { .. }
         | TuiInputMode::ConfirmDelete { .. } => match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => Some(TuiAction::Confirm),
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(TuiAction::Cancel),
@@ -507,13 +608,23 @@ fn key_to_action(key: KeyEvent, input_mode: &TuiInputMode) -> Option<TuiAction> 
             }
             _ => None,
         },
+        TuiInputMode::Help => match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => {
+                Some(TuiAction::Cancel)
+            }
+            _ => None,
+        },
         TuiInputMode::Normal => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(TuiAction::RequestQuit),
             KeyCode::Char('n') => Some(TuiAction::NewDraft),
             KeyCode::Char('s') => Some(TuiAction::BeginSaveAs),
+            KeyCode::Char('c') => Some(TuiAction::BeginCopy),
             KeyCode::Char('R') => Some(TuiAction::BeginRename),
             KeyCode::Char('d') => Some(TuiAction::BeginDelete),
             KeyCode::Char('a') => Some(TuiAction::ApplyDraft),
+            KeyCode::Char('A') => Some(TuiAction::AutoSelect),
+            KeyCode::Char('f') => Some(TuiAction::RefreshMonitors),
+            KeyCode::Char('?') => Some(TuiAction::ShowHelp),
             KeyCode::Char(' ') => Some(TuiAction::ToggleSelected),
             KeyCode::Char('m') => Some(TuiAction::CycleSelectedMode),
             KeyCode::Char('r') => Some(TuiAction::CycleSelectedTransform),
@@ -545,6 +656,42 @@ fn key_to_action(key: KeyEvent, input_mode: &TuiInputMode) -> Option<TuiAction> 
             KeyCode::Char('J') => Some(TuiAction::SnapSelected(SnapDirection::Below)),
             _ => None,
         },
+    }
+}
+
+fn render_help(frame: &mut Frame<'_>) {
+    let area = centered_rect(frame.area(), 76, 22);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let help = [
+        "Profiles: [/] browse, n new from current, s save-as, c copy, R rename, d delete",
+        "Selection: Tab/Shift-Tab monitors, mouse selects profiles and monitors",
+        "Layout: arrows nudge, H/J/K/L snap left/down/up/right, mouse drag moves",
+        "Output: Space enable, m mode, r transform, +/- scale",
+        "Actions: a apply/confirm warnings, A automatic select, f refresh current state",
+        "Safety: edits stay in a draft; replace, delete, warned apply, and dirty quit confirm",
+        "Quit: q or Esc. Close help: ? or Esc.",
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(help.join("\n\n"))
+            .block(Block::default().title("Help").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    let width = preferred_width.min(area.width);
+    let height = preferred_height.min(area.height);
+    Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        y: area
+            .y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
     }
 }
 

@@ -11,7 +11,7 @@ use crate::daemon::{
 };
 use crate::hyprland::hyprctl::current_monitors;
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::apply::{apply_plan, plan_apply, ApplyPlan};
+use crate::profile::apply::{apply_plan, ensure_plan_safe_to_apply, plan_apply, ApplyPlan};
 use crate::profile::r#match::{best_profile_match, BestProfileMatch};
 use crate::profile::render::{format_hyprctl_batch_command, render_hyprland_lua};
 use crate::profile::store::Profile;
@@ -34,7 +34,7 @@ enum Commands {
     List,
     /// Save the current monitor layout as a profile.
     Save {
-        /// Profile name. A default name will be chosen later when omitted.
+        /// Profile name. A collision-safe name is generated when omitted.
         name: Option<String>,
         /// Replace an existing profile with the same name.
         #[arg(long)]
@@ -305,6 +305,7 @@ fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
     };
 
     let plan = plan_apply(profile, &monitors)?;
+    ensure_plan_safe_to_apply(&plan)?;
     print_apply_warnings(&plan);
     let path = match format {
         ExportFormat::Lua => paths.generated_monitors_lua_path(),
@@ -386,6 +387,14 @@ fn apply_or_print(
 
     print_apply_warnings(plan);
 
+    if plan.is_noop {
+        println!(
+            "No changes: profile `{}` is already active.",
+            plan.profile_name
+        );
+        return Ok(());
+    }
+
     if let Err(error) = apply_plan(plan) {
         bail!(
             "{error:#}\nPrevious layout:\n{}",
@@ -403,9 +412,17 @@ fn apply_or_print(
 }
 
 fn format_apply_commands(plan: &ApplyPlan) -> String {
+    let safety_error = ensure_plan_safe_to_apply(plan).err();
     let mut output = format!(
-        "Profile: {}\nCommand:\n{}",
+        "Profile: {}\nOperation: {}\nGenerated command:\n{}",
         plan.profile_name,
+        if let Some(error) = &safety_error {
+            format!("refused: {error}")
+        } else if plan.is_noop {
+            "no changes; the profile is already active".to_owned()
+        } else {
+            "apply the generated monitor batch".to_owned()
+        },
         format_hyprctl_batch_command(&plan.batch)
     );
     if !plan.warnings.is_empty() {

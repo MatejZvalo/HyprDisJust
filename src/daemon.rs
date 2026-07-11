@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
@@ -62,6 +62,7 @@ pub struct AutoApplyRun {
     pub decision: AutoApplyDecision,
     pub batch: Option<String>,
     pub applied: bool,
+    pub skipped_noop: bool,
 }
 
 pub fn run(options: DaemonOptions) -> anyhow::Result<()> {
@@ -102,7 +103,7 @@ pub fn decide_auto_apply(
         };
     }
 
-    if best_match.ambiguous && has_auto_eligible_candidate(best_match) {
+    if best_match.ambiguous {
         return AutoApplyDecision::Ambiguous {
             reason: best_ambiguous_reason(best_match),
         };
@@ -120,12 +121,6 @@ pub fn decide_auto_apply(
 
         return AutoApplyDecision::MissingFallback {
             profile_name: fallback_profile.to_owned(),
-        };
-    }
-
-    if best_match.ambiguous {
-        return AutoApplyDecision::Ambiguous {
-            reason: best_ambiguous_reason(best_match),
         };
     }
 
@@ -211,7 +206,9 @@ fn process_socket_events(
 
         logger.log(&format!("Monitor event: {}", event.as_str()))?;
         debounce_monitor_events(reader, config.debounce_ms, logger)?;
-        run_once_with_paths(paths, config, dry_run, logger)?;
+        if let Err(error) = run_once_with_paths(paths, config, dry_run, logger) {
+            logger.log(&format!("Auto-apply failed: {error:#}"))?;
+        }
     }
 }
 
@@ -221,11 +218,32 @@ fn debounce_monitor_events(
     logger: &mut DaemonLogger,
 ) -> anyhow::Result<()> {
     let debounce = Duration::from_millis(debounce_ms);
+    let mut last_monitor_event = Instant::now();
     loop {
-        match reader.read_monitor_event_timeout(debounce)? {
-            Some(event) => logger.log(&format!("Monitor event: {}", event.as_str()))?,
+        let Some(remaining) = debounce_remaining(last_monitor_event, Instant::now(), debounce)
+        else {
+            return Ok(());
+        };
+        match reader.read_monitor_event_timeout(remaining)? {
+            Some(event) => {
+                logger.log(&format!("Monitor event: {}", event.as_str()))?;
+                last_monitor_event = Instant::now();
+            }
             None => return Ok(()),
         }
+    }
+}
+
+pub fn debounce_remaining(
+    last_monitor_event: Instant,
+    now: Instant,
+    debounce: Duration,
+) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last_monitor_event);
+    if elapsed >= debounce {
+        None
+    } else {
+        Some(debounce - elapsed)
     }
 }
 
@@ -248,6 +266,7 @@ fn run_once_with_paths(
             decision,
             batch: None,
             applied: false,
+            skipped_noop: false,
         });
     };
 
@@ -259,12 +278,26 @@ fn run_once_with_paths(
     ))?;
     log_apply_warnings(&plan.warnings, logger)?;
 
+    if plan.is_noop {
+        logger.log("No changes: selected profile is already active")?;
+        if dry_run {
+            logger.log("Dry run: monitor layout was not changed")?;
+        }
+        return Ok(AutoApplyRun {
+            decision,
+            batch: Some(plan.batch),
+            applied: false,
+            skipped_noop: true,
+        });
+    }
+
     if dry_run {
         logger.log("Dry run: monitor layout was not changed")?;
         return Ok(AutoApplyRun {
             decision,
             batch: Some(plan.batch),
             applied: false,
+            skipped_noop: false,
         });
     }
 
@@ -285,6 +318,7 @@ fn run_once_with_paths(
         decision,
         batch: Some(plan.batch),
         applied: true,
+        skipped_noop: false,
     })
 }
 
@@ -294,13 +328,6 @@ fn profile_by_name<'a>(store: &'a ProfileStore, name: &str) -> anyhow::Result<&'
         .iter()
         .find(|profile| profile.name == name)
         .ok_or_else(|| anyhow::anyhow!("profile `{name}` does not exist"))
-}
-
-fn has_auto_eligible_candidate(best_match: &BestProfileMatch) -> bool {
-    best_match
-        .candidates
-        .iter()
-        .any(|candidate| candidate.confidence.is_auto_apply_eligible())
 }
 
 fn normalized_fallback_profile(fallback_profile: Option<&str>) -> Option<&str> {

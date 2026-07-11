@@ -20,13 +20,13 @@ fn renders_exact_monitor_rules_from_saved_profile() {
     assert_eq!(
         rendered.rules,
         vec![
-            "hl.monitor({ output = \"DP-1\", mode = \"2560x1440@144\", position = \"0x0\", scale = 1 })",
-            "hl.monitor({ output = \"eDP-1\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })",
+            "hl.monitor({ output = \"DP-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 })",
+            "hl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })",
         ]
     );
     assert_eq!(
         rendered.batch,
-        "eval hl.monitor({ output = \"DP-1\", mode = \"2560x1440@144\", position = \"0x0\", scale = 1 }) ; eval hl.monitor({ output = \"eDP-1\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })"
+        "eval hl.monitor({ output = \"DP-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })"
     );
     assert_eq!(
         render_hyprland_lua(&rendered.rules).unwrap(),
@@ -45,8 +45,8 @@ fn maps_saved_monitor_ids_to_current_output_names() {
     assert_eq!(
         rendered.rules,
         vec![
-            "hl.monitor({ output = \"HDMI-A-1\", mode = \"2560x1440@144\", position = \"0x0\", scale = 1 })",
-            "hl.monitor({ output = \"eDP-2\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })",
+            "hl.monitor({ output = \"HDMI-A-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 })",
+            "hl.monitor({ output = \"eDP-2\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })",
         ]
     );
     assert_eq!(
@@ -72,7 +72,7 @@ fn disables_connected_outputs_that_are_not_in_the_profile() {
     assert_eq!(
         rendered.rules,
         vec![
-            "hl.monitor({ output = \"eDP-1\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })",
+            "hl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })",
             "hl.monitor({ output = \"DP-1\", disabled = true })",
         ]
     );
@@ -117,7 +117,7 @@ fn renders_disabled_outputs_and_transform_args() {
     assert_eq!(
         rendered.rules,
         vec![
-            "hl.monitor({ output = \"DP-3\", mode = \"1920x1080@60\", position = \"-1080x0\", scale = 1.5, transform = 1 })",
+            "hl.monitor({ output = \"DP-3\", disabled = false, mode = \"1920x1080@60\", position = \"-1080x0\", scale = 1.5, transform = 1 })",
             "hl.monitor({ output = \"HDMI-A-2\", disabled = true })",
         ]
     );
@@ -132,7 +132,7 @@ fn renders_lua_export_as_deterministic_monitor_calls() {
 
     assert_eq!(
         render_hyprland_lua(&rendered.rules).unwrap(),
-        "hl.monitor({ output = \"DP-1\", mode = \"2560x1440@144\", position = \"0x0\", scale = 1 })\nhl.monitor({ output = \"eDP-1\", mode = \"1920x1200@60\", position = \"2560x240\", scale = 1 })"
+        "hl.monitor({ output = \"DP-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 })\nhl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })"
     );
 }
 
@@ -158,7 +158,7 @@ fn escapes_lua_monitor_rule_values() {
 
     assert_eq!(
         render_hyprland_lua(&rendered.rules).unwrap(),
-        "hl.monitor({ output = \"DP\\\"1\", mode = \"preferred\\\\mode\", position = \"0x0\", scale = 1 })"
+        "hl.monitor({ output = \"DP\\\"1\", disabled = false, mode = \"preferred\\\\mode\", position = \"0x0\", scale = 1, transform = 0 })"
     );
 }
 
@@ -172,6 +172,33 @@ fn refuses_profiles_when_required_monitor_is_missing() {
         .to_string();
 
     assert!(error.contains("failed to map profile `desk` monitor"));
+}
+
+#[test]
+fn skips_a_missing_monitor_when_the_profile_wants_it_disabled() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut profile = profile_from_monitors("laptop", &monitors);
+    profile.outputs[0].enabled = false;
+
+    let rendered = render_monitor_rules(&profile, &monitors[1..]).unwrap();
+
+    assert_eq!(rendered.rules.len(), 1);
+    assert!(rendered.rules[0].contains("output = \"eDP-1\""));
+    assert!(rendered.rules[0].contains("disabled = false"));
+}
+
+#[test]
+fn enables_are_rendered_before_disables_regardless_of_profile_order() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut profile = profile_from_monitors("laptop", &monitors);
+    profile.outputs[0].enabled = false;
+
+    let rendered = render_monitor_rules(&profile, &monitors).unwrap();
+
+    assert!(rendered.rules[0].contains("output = \"eDP-1\""));
+    assert!(rendered.rules[0].contains("disabled = false"));
+    assert!(rendered.rules[1].contains("output = \"DP-1\""));
+    assert!(rendered.rules[1].contains("disabled = true"));
 }
 
 #[test]
@@ -302,7 +329,7 @@ fn apply_plan_uses_scaled_transformed_logical_size_for_overlap_warnings() {
 }
 
 #[test]
-fn apply_plan_refuses_invalid_enabled_scale() {
+fn apply_plan_refuses_invalid_scale_even_while_disabled() {
     let current = vec![monitor("DP-1", "acme:bad:123")];
     let mut profile = Profile {
         name: "bad".to_owned(),
@@ -324,7 +351,57 @@ fn apply_plan_refuses_invalid_enabled_scale() {
     assert!(error.contains("invalid scale"));
 
     profile.outputs[0].enabled = false;
-    assert!(plan_apply(&profile, &current).is_ok());
+    assert!(plan_apply(&profile, &current)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid scale"));
+}
+
+#[test]
+fn apply_plan_refuses_invalid_transform_and_zero_sized_enabled_mode() {
+    let current = vec![monitor("DP-1", "acme:bad:123")];
+    let mut profile = profile_from_monitors("bad", &current);
+    profile.outputs[0].transform = 8;
+    assert!(plan_apply(&profile, &current)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid transform"));
+
+    profile.outputs[0].transform = 0;
+    profile.outputs[0].mode = "0x0@0".to_owned();
+    assert!(plan_apply(&profile, &current)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid mode"));
+}
+
+#[test]
+fn apply_plan_detects_already_active_and_changed_layouts() {
+    let current = parse_monitors_output(DESK).unwrap();
+    let mut profile = profile_from_monitors("desk", &current);
+
+    assert!(plan_apply(&profile, &current).unwrap().is_noop);
+
+    profile.outputs[0].x += 20;
+    assert!(!plan_apply(&profile, &current).unwrap().is_noop);
+}
+
+#[test]
+fn apply_plan_refuses_duplicate_outputs_and_malformed_modes() {
+    let current = parse_monitors_output(DESK).unwrap();
+    let mut profile = profile_from_monitors("desk", &current);
+    profile.outputs.push(profile.outputs[0].clone());
+    assert!(plan_apply(&profile, &current)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate output"));
+
+    profile.outputs.pop();
+    profile.outputs[0].mode = "1920-by-1080".to_owned();
+    assert!(plan_apply(&profile, &current)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid mode"));
 }
 
 fn profile_from_monitors(name: &str, monitors: &[MonitorState]) -> Profile {

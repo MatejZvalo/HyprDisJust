@@ -1,7 +1,7 @@
-use anyhow::{bail, Context};
+use anyhow::bail;
 
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::r#match::profile_monitor_match_score;
+use crate::profile::r#match::resolve_monitor_matches;
 use crate::profile::store::{Profile, ProfileMonitor, ProfileOutput};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,20 +26,60 @@ pub fn render_monitor_rules(
         bail!("profile `{}` has no saved monitor outputs", profile.name);
     }
 
+    let ordered_outputs: Vec<_> = profile
+        .outputs
+        .iter()
+        .filter(|output| output.enabled)
+        .chain(profile.outputs.iter().filter(|output| !output.enabled))
+        .collect();
+    let mapping_monitors: Vec<_> = ordered_outputs
+        .iter()
+        .map(|output| {
+            profile
+                .monitors
+                .iter()
+                .find(|monitor| monitor.id == output.monitor_id)
+                .cloned()
+                .unwrap_or_else(|| ProfileMonitor {
+                    id: output.monitor_id.clone(),
+                    name_hint: String::new(),
+                    description: String::new(),
+                    make: String::new(),
+                    model: String::new(),
+                    serial: String::new(),
+                })
+        })
+        .collect();
+    let resolved = resolve_monitor_matches(&mapping_monitors, current);
     let mut used_current = vec![false; current.len()];
     let mut mappings = Vec::with_capacity(current.len().max(profile.outputs.len()));
     let mut rules = Vec::with_capacity(current.len().max(profile.outputs.len()));
 
-    for output in &profile.outputs {
-        let current_output_name =
-            resolve_current_output_name(profile, output, current, &mut used_current).with_context(
-                || {
-                    format!(
-                        "failed to map profile `{}` monitor `{}` to a current output",
-                        profile.name, output.monitor_id
-                    )
-                },
-            )?;
+    // Hyprland applies a batch sequentially. Configure every desired active
+    // output before disabling anything so a profile transition cannot create
+    // a transient zero-output layout.
+    for (output, resolved) in ordered_outputs.into_iter().zip(resolved) {
+        let Some(resolved) = resolved else {
+            // A desired-disabled monitor that is physically absent already has
+            // the requested outcome. Do not make it a required dependency.
+            if !output.enabled {
+                continue;
+            }
+            bail!(
+                "failed to map profile `{}` monitor `{}` to a current output: required monitor is not currently connected",
+                profile.name,
+                output.monitor_id
+            );
+        };
+        if resolved.ambiguous {
+            bail!(
+                "failed to map profile `{}` monitor `{}` to a current output: monitor maps to multiple current outputs",
+                profile.name,
+                output.monitor_id
+            );
+        }
+        used_current[resolved.current_index] = true;
+        let current_output_name = current[resolved.current_index].output_name.clone();
         let rule = render_monitor_rule(&current_output_name, output)?;
         mappings.push(RuleMapping {
             monitor_id: output.monitor_id.clone(),
@@ -110,58 +150,6 @@ fn validate_lua_monitor_call(rule: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_current_output_name(
-    profile: &Profile,
-    output: &ProfileOutput,
-    current: &[MonitorState],
-    used_current: &mut [bool],
-) -> anyhow::Result<String> {
-    let profile_monitor = profile
-        .monitors
-        .iter()
-        .find(|monitor| monitor.id == output.monitor_id);
-
-    let mut best_score = 0;
-    let mut best_indexes = Vec::new();
-
-    for (current_index, current_monitor) in current.iter().enumerate() {
-        if used_current[current_index] {
-            continue;
-        }
-
-        let score = match profile_monitor {
-            Some(profile_monitor) => {
-                profile_monitor_match_score(profile_monitor, current_monitor).0
-            }
-            None if output.monitor_id == current_monitor.id => 100,
-            None => 0,
-        };
-
-        if score > best_score {
-            best_score = score;
-            best_indexes.clear();
-            best_indexes.push(current_index);
-        } else if score == best_score && score > 0 {
-            best_indexes.push(current_index);
-        }
-    }
-
-    if best_score <= 0 {
-        bail!("required monitor is not currently connected");
-    }
-
-    if best_indexes.len() > 1 {
-        let label = profile_monitor
-            .map(profile_monitor_label)
-            .unwrap_or_else(|| output.monitor_id.clone());
-        bail!("monitor `{label}` maps to multiple current outputs");
-    }
-
-    let current_index = best_indexes[0];
-    used_current[current_index] = true;
-    Ok(current[current_index].output_name.clone())
-}
-
 fn render_disabled_monitor_rule(output_name: &str) -> anyhow::Result<String> {
     validate_batch_component(output_name, "output name")?;
     Ok(format!(
@@ -178,16 +166,14 @@ fn render_monitor_rule(output_name: &str, output: &ProfileOutput) -> anyhow::Res
     }
 
     validate_batch_component(&output.mode, "monitor mode")?;
-    let mut fields = vec![
+    let fields = [
         format!("output = \"{}\"", escape_lua_string(output_name)),
+        "disabled = false".to_owned(),
         format!("mode = \"{}\"", escape_lua_string(&output.mode)),
         format!("position = \"{}x{}\"", output.x, output.y),
         format!("scale = {}", format_number(output.scale)),
+        format!("transform = {}", output.transform),
     ];
-
-    if output.transform != 0 {
-        fields.push(format!("transform = {}", output.transform));
-    }
 
     Ok(format!("hl.monitor({{ {} }})", fields.join(", ")))
 }
@@ -202,14 +188,6 @@ fn validate_batch_component(value: &str, label: &str) -> anyhow::Result<()> {
 
 fn escape_lua_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn profile_monitor_label(profile_monitor: &ProfileMonitor) -> String {
-    if !profile_monitor.name_hint.trim().is_empty() {
-        return profile_monitor.name_hint.clone();
-    }
-
-    profile_monitor.id.clone()
 }
 
 fn format_number(value: f64) -> String {

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use hyprdisjust::daemon::debounce_remaining;
 use hyprdisjust::hyprland::ipc::{
     discover_socket2_path_with, parse_monitor_event, socket2_path, MonitorSocketEvent,
 };
@@ -69,4 +71,23 @@ fn refuses_ambiguous_socket2_discovery() {
         .to_string();
 
     assert!(error.contains("multiple socket2 sockets"));
+}
+
+#[test]
+fn debounce_decision_waits_from_the_last_monitor_event() {
+    let event = Instant::now();
+    let debounce = Duration::from_millis(900);
+
+    assert_eq!(
+        debounce_remaining(event, event + Duration::from_millis(250), debounce),
+        Some(Duration::from_millis(650))
+    );
+    assert_eq!(
+        debounce_remaining(event, event + Duration::from_millis(900), debounce),
+        None
+    );
+    assert_eq!(
+        debounce_remaining(event, event + Duration::from_millis(901), debounce),
+        None
+    );
 }

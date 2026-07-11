@@ -19,6 +19,7 @@ pub struct ConfigPaths {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub fallback_profile: Option<String>,
     #[serde(default = "default_debounce_ms")]
@@ -127,8 +128,12 @@ impl AppConfig {
             }
         };
 
-        toml::from_str(&contents)
-            .with_context(|| format!("failed to parse config at {}", path.display()))
+        let config: Self = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse config at {}", path.display()))?;
+        if !(1..=10_000).contains(&config.tui_move_step) {
+            bail!("tui_move_step must be between 1 and 10000");
+        }
+        Ok(config)
     }
 }
 

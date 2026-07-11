@@ -1,4 +1,5 @@
 use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,12 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::hyprland::monitor::MonitorState;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileStore {
     #[serde(default)]
     pub profiles: Vec<Profile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub name: String,
     pub created_at: String,
@@ -26,6 +29,7 @@ pub struct Profile {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileMonitor {
     pub id: String,
     pub name_hint: String,
@@ -36,6 +40,7 @@ pub struct ProfileMonitor {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileOutput {
     pub monitor_id: String,
     pub enabled: bool,
@@ -49,14 +54,21 @@ pub struct ProfileOutput {
 impl ProfileStore {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("failed to read profile store at {}", path.display()))?;
-        toml::from_str(&contents)
-            .with_context(|| format!("failed to parse profile store at {}", path.display()))
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read profile store at {}", path.display())
+                });
+            }
+        };
+        let store: Self = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse profile store at {}", path.display()))?;
+        store
+            .validate()
+            .with_context(|| format!("invalid profile store at {}", path.display()))?;
+        Ok(store)
     }
 
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -247,6 +259,11 @@ impl ProfileStore {
     ) -> anyhow::Result<()> {
         let source_name = validate_profile_name(source_name)?;
         let destination_name = validate_profile_name(destination_name)?;
+        if source_name == destination_name {
+            bail!(
+                "destination profile `{destination_name}` already exists as the source; choose a different name"
+            );
+        }
         let Some(source) = self
             .profiles
             .iter()
@@ -262,6 +279,20 @@ impl ProfileStore {
         profile.created_at = now.clone();
         profile.updated_at = now;
         self.save_profile(profile, replace)?;
+        Ok(())
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for profile in &self.profiles {
+            let name = validate_profile_name(&profile.name)?;
+            if profile.name != name {
+                bail!("profile name `{}` has surrounding whitespace", profile.name);
+            }
+            if !names.insert(name) {
+                bail!("duplicate profile name `{name}`");
+            }
+        }
         Ok(())
     }
 }
@@ -298,10 +329,19 @@ impl From<&MonitorState> for ProfileMonitor {
 
 impl From<&MonitorState> for ProfileOutput {
     fn from(monitor: &MonitorState) -> Self {
+        let mode = if monitor.width > 0 && monitor.height > 0 {
+            format_mode(monitor.width, monitor.height, monitor.refresh_rate)
+        } else {
+            monitor
+                .available_modes
+                .first()
+                .map(|mode| mode.strip_suffix("Hz").unwrap_or(mode).to_owned())
+                .unwrap_or_else(|| "preferred".to_owned())
+        };
         Self {
             monitor_id: monitor.id.clone(),
             enabled: monitor.enabled,
-            mode: format_mode(monitor.width, monitor.height, monitor.refresh_rate),
+            mode,
             x: monitor.x,
             y: monitor.y,
             scale: monitor.scale,

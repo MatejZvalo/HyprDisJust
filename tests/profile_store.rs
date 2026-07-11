@@ -7,6 +7,7 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
 const DESK: &str = include_str!("fixtures/hyprctl-monitors-desk.json");
+const INACTIVE: &str = include_str!("fixtures/hyprctl-monitors-inactive.json");
 
 const DUPLICATE_NO_SERIAL: &str = r#"[
   {
@@ -87,6 +88,21 @@ fn profile_store_roundtrips_as_toml() {
 }
 
 #[test]
+fn inactive_zero_geometry_is_saved_with_a_safe_mode() {
+    let monitors = parse_monitors_output(INACTIVE).unwrap();
+    let profile = hyprdisjust::profile::store::Profile::from_monitors(
+        "inactive".to_owned(),
+        &monitors,
+        "created".to_owned(),
+        "updated".to_owned(),
+    );
+
+    assert!(!profile.outputs[0].enabled);
+    assert_ne!(profile.outputs[0].mode, "0x0@0");
+    assert!(profile.outputs[0].mode == "preferred" || profile.outputs[0].mode.contains('x'));
+}
+
+#[test]
 fn missing_profile_store_loads_empty() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("profiles.toml");
@@ -102,9 +118,36 @@ fn malformed_profile_store_has_context() {
     let path = temp.path().join("profiles.toml");
     fs::write(&path, "not valid = [").unwrap();
 
-    let error = ProfileStore::load(&path).unwrap_err().to_string();
+    let error = format!("{:#}", ProfileStore::load(&path).unwrap_err());
 
     assert!(error.contains("failed to parse profile store"));
+}
+
+#[test]
+fn unsupported_profile_fields_are_rejected_instead_of_dropped() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    fs::write(&path, "unsupported = true\n").unwrap();
+
+    let error = format!("{:#}", ProfileStore::load(&path).unwrap_err());
+
+    assert!(error.contains("failed to parse profile store"));
+    assert!(error.contains("unknown field"));
+}
+
+#[test]
+fn duplicate_profile_names_are_rejected_on_load() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    fs::write(
+        &path,
+        "[[profiles]]\nname = \"desk\"\ncreated_at = \"a\"\nupdated_at = \"a\"\n\n[[profiles]]\nname = \"desk\"\ncreated_at = \"b\"\nupdated_at = \"b\"\n",
+    )
+    .unwrap();
+
+    assert!(
+        format!("{:#}", ProfileStore::load(&path).unwrap_err()).contains("duplicate profile name")
+    );
 }
 
 #[test]

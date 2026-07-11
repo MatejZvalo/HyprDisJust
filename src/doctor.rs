@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
 
@@ -73,12 +73,18 @@ pub fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
     );
     report.push(
         DoctorSeverity::Info,
+        "generated directory",
+        paths.generated_dir_path().display().to_string(),
+    );
+    report.push(
+        DoctorSeverity::Info,
         "generated lua",
         generated_path_status(&paths.generated_monitors_lua_path()),
     );
 
     check_session_env(&mut report);
     check_socket(&mut report);
+    check_systemd(&mut report);
 
     let store = match ProfileStore::load(paths.profile_store_path()) {
         Ok(store) => {
@@ -106,7 +112,14 @@ pub fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
 
     let config = match AppConfig::load(paths.config_file_path()) {
         Ok(config) => {
-            report.push(DoctorSeverity::Ok, "config", "loaded");
+            report.push(
+                DoctorSeverity::Ok,
+                "config",
+                format!(
+                    "loaded (debounce={}ms, apply_on_start={})",
+                    config.debounce_ms, config.apply_on_start
+                ),
+            );
             Some(config)
         }
         Err(error) => {
@@ -141,8 +154,14 @@ pub fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
                     &best_match,
                     config.fallback_profile.as_deref(),
                 );
-                report.best_profile_summary =
-                    Some(format_auto_apply_decision(&decision, "Best profile"));
+                let mut summary = format_auto_apply_decision(&decision, "Best profile");
+                if let Some(candidate) = best_match.candidates.first() {
+                    summary.push_str(&format!(
+                        "\nScore: {} ({} of {} profile monitors matched)",
+                        candidate.score, candidate.matched_monitors, candidate.profile_monitors
+                    ));
+                }
+                report.best_profile_summary = Some(summary);
             }
             report.monitors = monitors;
         }
@@ -204,6 +223,29 @@ fn check_socket(report: &mut DoctorReport) {
     }
 }
 
+fn check_systemd(report: &mut DoctorReport) {
+    match crate::systemd::user_service_path() {
+        Ok(path) if path.exists() => report.push(
+            DoctorSeverity::Ok,
+            "systemd user service",
+            format!("installed at {}", path.display()),
+        ),
+        Ok(path) => report.push(
+            DoctorSeverity::Info,
+            "systemd user service",
+            format!(
+                "not installed at {}; run `hyprdisjust install-systemd-user --enable --start`",
+                path.display()
+            ),
+        ),
+        Err(error) => report.push(
+            DoctorSeverity::Warning,
+            "systemd user service",
+            format!("could not resolve install path: {error:#}"),
+        ),
+    }
+}
+
 fn check_monitor_identities(report: &mut DoctorReport, monitors: &[MonitorState]) {
     let mut warned = false;
     for monitor in monitors {
@@ -244,7 +286,7 @@ fn check_stale_output_names(
     store: &ProfileStore,
     monitors: &[MonitorState],
 ) {
-    let mut stale = HashSet::new();
+    let mut stale = BTreeSet::new();
     for profile in &store.profiles {
         for saved_monitor in &profile.monitors {
             let Some(current) = monitors

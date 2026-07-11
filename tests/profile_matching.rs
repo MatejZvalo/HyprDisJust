@@ -206,6 +206,78 @@ fn output_name_only_match_is_partial() {
 }
 
 #[test]
+fn exact_description_is_the_explicit_high_confidence_threshold() {
+    let current = parse_monitors_output(DESK).unwrap();
+    let mut profile = profile_from_monitors("desk", &current);
+    for monitor in &mut profile.monitors {
+        monitor.id = format!("stale:{}", monitor.id);
+        monitor.serial = "stale".to_owned();
+    }
+
+    let profile_match = match_profile(&profile, &current);
+
+    assert_eq!(profile_match.confidence, MatchConfidence::High);
+    assert_eq!(profile_match.score, 120);
+}
+
+#[test]
+fn monitor_ambiguity_blocks_configured_fallback() {
+    let saved = parse_monitors_output(DUPLICATE_NO_SERIAL).unwrap();
+    let current = parse_monitors_output(DUPLICATE_NO_SERIAL_RENAMED).unwrap();
+    let mut store = ProfileStore::default();
+    store.profiles.push(profile_from_monitors("twins", &saved));
+    store
+        .profiles
+        .push(profile_from_monitors("fallback", &[unknown_monitor()]));
+
+    let best_match = best_profile_match(&store, &current);
+    let decision = decide_auto_apply(&store, &best_match, Some("fallback"));
+
+    assert!(matches!(decision, AutoApplyDecision::Ambiguous { .. }));
+}
+
+#[test]
+fn global_mapping_preserves_an_exact_match_instead_of_greedily_consuming_it() {
+    let mut first = unknown_monitor();
+    first.output_name = "Virtual-1".to_owned();
+    first.id = "virtual:shared:one".to_owned();
+    first.description = "Shared panel".to_owned();
+    let mut second = first.clone();
+    second.output_name = "Virtual-2".to_owned();
+    second.id = "virtual:shared:two".to_owned();
+    let current = vec![first.clone(), second];
+    let profile = Profile {
+        name: "global".to_owned(),
+        created_at: "created".to_owned(),
+        updated_at: "updated".to_owned(),
+        monitors: vec![
+            ProfileMonitor {
+                id: "stale".to_owned(),
+                name_hint: String::new(),
+                description: "Shared panel".to_owned(),
+                make: String::new(),
+                model: String::new(),
+                serial: String::new(),
+            },
+            ProfileMonitor::from(&first),
+        ],
+        outputs: vec![],
+    };
+
+    let profile_match = match_profile(&profile, &current);
+
+    assert_eq!(profile_match.confidence, MatchConfidence::High);
+    assert!(profile_match
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("matched Virtual-2 by exact description")));
+    assert!(profile_match
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("matched Virtual-1 by exact monitor id")));
+}
+
+#[test]
 fn best_profile_match_reports_ambiguous_exact_tie() {
     let monitors = parse_monitors_output(DESK).unwrap();
     let mut store = ProfileStore::default();
@@ -405,10 +477,34 @@ fn malformed_app_config_has_context() {
     let config_path = temp.path().join("config.toml");
     fs::write(&config_path, "fallback_profile = [").unwrap();
 
-    let error = AppConfig::load(&config_path).unwrap_err().to_string();
+    let error = format!("{:#}", AppConfig::load(&config_path).unwrap_err());
 
     assert!(error.contains("failed to parse config"));
     assert!(error.contains("config.toml"));
+}
+
+#[test]
+fn unknown_app_config_fields_are_rejected() {
+    let temp = tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(&config_path, "debouce_ms = 100\n").unwrap();
+
+    let error = format!("{:#}", AppConfig::load(&config_path).unwrap_err());
+
+    assert!(error.contains("failed to parse config"));
+    assert!(error.contains("unknown field"));
+}
+
+#[test]
+fn invalid_tui_move_step_is_rejected() {
+    let temp = tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(&config_path, "tui_move_step = 0\n").unwrap();
+
+    assert!(AppConfig::load(&config_path)
+        .unwrap_err()
+        .to_string()
+        .contains("tui_move_step must be between"));
 }
 
 #[test]
@@ -455,7 +551,7 @@ fn apply_auto_dry_run_explains_selected_profile() {
     assert!(stdout.contains("Would select profile: desk"));
     assert!(stdout.contains("Confidence: exact"));
     assert!(stdout.contains(
-        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1 })\""
+        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", disabled = false, mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", disabled = false, mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1, transform = 0 })\""
     ));
 }
 
@@ -479,7 +575,7 @@ fn apply_named_dry_run_prints_exact_hyprctl_batch() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Profile: desk"));
     assert!(stdout.contains(
-        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1 })\""
+        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", disabled = false, mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", disabled = false, mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1, transform = 0 })\""
     ));
 }
 

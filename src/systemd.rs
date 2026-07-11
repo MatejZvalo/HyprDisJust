@@ -43,6 +43,7 @@ pub fn install_user_service(
         fs::write(&service_path, &service_contents).with_context(|| {
             format!("failed to write systemd service {}", service_path.display())
         })?;
+        run_systemctl(&["daemon-reload"])?;
     }
 
     if options.enable && !options.dry_run {
@@ -66,6 +67,10 @@ pub fn render_user_service(exe: &Path) -> String {
         "[Unit]\nDescription=HyprDisJust monitor profile daemon\nAfter=graphical-session.target\n\n[Service]\nExecStart={} daemon\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
         quote_systemd_arg(exe)
     )
+}
+
+pub fn user_service_path() -> anyhow::Result<PathBuf> {
+    Ok(systemd_user_dir()?.join(SERVICE_NAME))
 }
 
 fn systemd_user_dir() -> anyhow::Result<PathBuf> {

@@ -340,6 +340,113 @@ fn tui_can_rename_and_delete_saved_profiles() {
 }
 
 #[test]
+fn tui_can_copy_a_saved_profile_with_a_collision_safe_name() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), store, monitors);
+
+    app.handle_action(TuiAction::BeginCopy).unwrap();
+    assert!(matches!(
+        app.input_mode,
+        TuiInputMode::CopyProfile { ref source, ref name }
+            if source == "desk" && name == "desk-copy"
+    ));
+    app.handle_action(TuiAction::Submit).unwrap();
+
+    let saved = ProfileStore::load(temp.path().join("profiles.toml")).unwrap();
+    assert!(saved.has_profile("desk"));
+    assert!(saved.has_profile("desk-copy"));
+    assert_eq!(
+        app.view_model().selected_profile.as_deref(),
+        Some("desk-copy")
+    );
+}
+
+#[test]
+fn tui_refresh_and_auto_selection_are_explicit_actions() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), store, monitors.clone());
+
+    assert_eq!(
+        app.handle_action(TuiAction::RefreshMonitors).unwrap(),
+        TuiEffect::RefreshMonitors
+    );
+    let mut refreshed = monitors;
+    refreshed[0].x = 40;
+    app.update_monitors(refreshed);
+    assert!(app.status.contains("Refreshed 2 current monitors"));
+
+    app.handle_action(TuiAction::AutoSelect).unwrap();
+    assert!(app.status.contains("Automatic selection: desk"));
+    assert!(app.status.contains("Confidence: exact"));
+    assert!(app.status.contains("Reason:"));
+}
+
+#[test]
+fn tui_validation_errors_stay_in_the_editor() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), store, monitors);
+    app.draft.outputs[0].scale = 0.0;
+
+    let effect = app.handle_action(TuiAction::ApplyDraft).unwrap();
+
+    assert_eq!(effect, TuiEffect::None);
+    assert!(app.status.contains("Draft cannot be applied"));
+    assert!(app.status.contains("invalid scale"));
+}
+
+#[test]
+fn modified_draft_cannot_be_silently_replaced_by_profile_navigation() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    store
+        .save_current_profile(Some("other"), &monitors, false)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), store, monitors);
+    app.handle_action(TuiAction::MoveSelected(25, 0)).unwrap();
+    let before = app.draft.clone();
+
+    app.handle_action(TuiAction::NextProfile).unwrap();
+
+    assert_eq!(app.draft, before);
+    assert!(app.status.contains("Save the modified draft"));
+}
+
+#[test]
+fn help_overlay_and_small_terminal_render_without_panicking() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let store = ProfileStore::default();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), store, monitors);
+    app.handle_action(TuiAction::ShowHelp).unwrap();
+    let model = app.view_model();
+
+    for (width, height) in [(100, 30), (12, 4), (1, 1)] {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+    }
+}
+
+#[test]
 fn dirty_quit_requires_confirmation() {
     let monitors = parse_monitors_output(DESK).unwrap();
     let mut store = ProfileStore::default();

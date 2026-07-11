@@ -6,6 +6,7 @@ use std::process::Command;
 use anyhow::{anyhow, Context};
 
 use super::monitor::{normalize_monitors, parse_raw_monitors, MonitorState};
+use crate::hyprland::ipc::socket2_path_from_env;
 
 const MONITORS_JSON_ENV: &str = "HYPRDISJUST_MONITORS_JSON";
 
@@ -13,7 +14,7 @@ pub struct HyprctlClient;
 
 impl HyprctlClient {
     pub fn monitors_all(&self) -> anyhow::Result<Vec<MonitorState>> {
-        let output = Command::new("hyprctl")
+        let output = hyprctl_command()
             .args(["-j", "monitors", "all"])
             .output()
             .map_err(|error| {
@@ -26,9 +27,19 @@ impl HyprctlClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let details = [stderr.trim(), stdout.trim()]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
             return Err(anyhow!(
                 "failed to query Hyprland monitors with `hyprctl -j monitors all`: {}",
-                stderr.trim()
+                if details.is_empty() {
+                    format!("hyprctl exited with {}", output.status)
+                } else {
+                    details
+                }
             ));
         }
 
@@ -36,7 +47,7 @@ impl HyprctlClient {
     }
 
     pub fn apply_monitor_batch(&self, batch: &str) -> anyhow::Result<()> {
-        let output = Command::new("hyprctl")
+        let output = hyprctl_command()
             .args(["--batch", batch])
             .output()
             .map_err(|error| {
@@ -83,6 +94,18 @@ impl HyprctlClient {
 
         Ok(())
     }
+}
+
+fn hyprctl_command() -> Command {
+    let mut command = Command::new("hyprctl");
+    if env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        if let Ok(socket_path) = socket2_path_from_env() {
+            if let Some(signature) = socket_path.parent().and_then(|path| path.file_name()) {
+                command.env("HYPRLAND_INSTANCE_SIGNATURE", signature);
+            }
+        }
+    }
+    command
 }
 
 pub fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
