@@ -20,8 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::hyprland::hyprctl::current_monitors;
-use crate::profile::apply::apply_plan;
+use crate::hyprland::hyprctl::{current_monitors, live_monitors};
+use crate::profile::apply::{apply_plan_safely, ApplyOutcome, TerminalConfirmation};
 
 use self::geometry::{output_rect, CanvasTransform, SnapDirection};
 pub use self::model::{
@@ -104,13 +104,24 @@ fn handle_effect(app: &mut TuiApp, action: TuiAction) -> anyhow::Result<bool> {
     match app.handle_action(action)? {
         TuiEffect::None => Ok(false),
         TuiEffect::Quit => Ok(true),
-        TuiEffect::Apply(plan) => {
+        TuiEffect::Apply(_) => {
+            let monitors = live_monitors()
+                .context("failed to refresh monitors immediately before TUI apply")?;
+            let plan = app.draft_apply_plan_for_monitors(monitors)?;
             if plan.is_noop {
                 app.mark_noop();
                 return Ok(false);
             }
-            match apply_plan(&plan) {
-                Ok(()) => app.mark_applied(),
+            let mut confirmation = TerminalConfirmation;
+            match apply_plan_safely(&plan, Some(&mut confirmation)) {
+                Ok(ApplyOutcome::Confirmed) => app.mark_applied(),
+                Ok(ApplyOutcome::RolledBack { reason }) => app.mark_apply_failed(&anyhow::anyhow!(
+                    "profile was not confirmed ({reason}); previous layout restored"
+                )),
+                Ok(ApplyOutcome::Noop) => app.mark_noop(),
+                Ok(ApplyOutcome::Unattended) => app.mark_apply_failed(&anyhow::anyhow!(
+                    "TUI apply completed without the required confirmation"
+                )),
                 Err(error) => app.mark_apply_failed(&error),
             }
             Ok(false)

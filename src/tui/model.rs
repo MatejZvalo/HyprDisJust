@@ -1,10 +1,12 @@
 use anyhow::{bail, Context};
 
 use crate::config::{AppConfig, ConfigPaths};
-use crate::daemon::{decide_auto_apply, format_auto_apply_decision, AutoApplyDecision};
 use crate::hyprland::monitor::MonitorState;
 use crate::profile::apply::{ensure_plan_safe_to_apply, plan_apply, ApplyPlan};
-use crate::profile::r#match::{best_profile_match, resolve_monitor_matches};
+use crate::profile::r#match::{
+    best_profile_match, decide_auto_apply, format_auto_apply_decision, resolve_monitor_matches,
+    AutoApplyDecision,
+};
 use crate::profile::store::{Profile, ProfileMonitor, ProfileOutput, ProfileStore};
 
 use super::geometry::{move_output, snap_output, SnapDirection};
@@ -100,7 +102,7 @@ pub enum TuiAction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TuiEffect {
     None,
-    Apply(ApplyPlan),
+    Apply(Box<ApplyPlan>),
     RefreshMonitors,
     Quit,
 }
@@ -292,7 +294,7 @@ impl TuiApp {
             TuiInputMode::ConfirmApply => match action {
                 TuiAction::Confirm | TuiAction::Submit => {
                     self.input_mode = TuiInputMode::Normal;
-                    Ok(TuiEffect::Apply(self.draft_apply_plan()?))
+                    Ok(TuiEffect::Apply(Box::new(self.draft_apply_plan()?)))
                 }
                 TuiAction::Cancel | TuiAction::RequestQuit => {
                     self.input_mode = TuiInputMode::Normal;
@@ -488,6 +490,14 @@ impl TuiApp {
 
     pub fn draft_apply_plan(&self) -> anyhow::Result<ApplyPlan> {
         plan_apply(&self.draft, &self.monitors)
+    }
+
+    pub fn draft_apply_plan_for_monitors(
+        &mut self,
+        monitors: Vec<MonitorState>,
+    ) -> anyhow::Result<ApplyPlan> {
+        self.monitors = monitors;
+        self.draft_apply_plan()
     }
 
     pub fn mark_applied(&mut self) {
@@ -972,7 +982,7 @@ impl TuiApp {
         let plan = self.draft_apply_plan()?;
         ensure_plan_safe_to_apply(&plan)?;
         if plan.warnings.is_empty() {
-            return Ok(TuiEffect::Apply(plan));
+            return Ok(TuiEffect::Apply(Box::new(plan)));
         }
 
         self.input_mode = TuiInputMode::ConfirmApply;
@@ -1047,17 +1057,7 @@ fn draft_from_current(store: &ProfileStore, monitors: &[MonitorState]) -> Profil
 }
 
 fn next_copy_name(store: &ProfileStore, source: &str) -> String {
-    let base = format!("{source}-copy");
-    if !store.has_profile(&base) {
-        return base;
-    }
-    for suffix in 2.. {
-        let candidate = format!("{base}-{suffix}");
-        if !store.has_profile(&candidate) {
-            return candidate;
-        }
-    }
-    unreachable!("infinite suffix search should find a copy name")
+    store.next_available_name(&format!("{source}-copy"))
 }
 
 fn first_selectable_monitor(profile: &Profile) -> Option<usize> {

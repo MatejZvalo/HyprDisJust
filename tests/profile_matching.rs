@@ -4,10 +4,12 @@ use std::process::Command;
 
 use hyprdisjust::cli::format_auto_apply_dry_run;
 use hyprdisjust::config::AppConfig;
-use hyprdisjust::daemon::{decide_auto_apply, AutoApplyDecision};
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
 use hyprdisjust::hyprland::monitor::MonitorState;
-use hyprdisjust::profile::r#match::{best_profile_match, match_profile, MatchConfidence};
+use hyprdisjust::profile::r#match::{
+    best_profile_match, decide_auto_apply, match_profile, profile_monitor_match_score,
+    AutoApplyDecision, MatchConfidence,
+};
 use hyprdisjust::profile::store::{Profile, ProfileMonitor, ProfileStore};
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
@@ -195,6 +197,8 @@ fn output_name_only_match_is_partial() {
             make: "Different".to_owned(),
             model: "Display".to_owned(),
             serial: "different".to_owned(),
+            physical_width: 0,
+            physical_height: 0,
         }],
         outputs: vec![],
     };
@@ -218,6 +222,20 @@ fn exact_description_is_the_explicit_high_confidence_threshold() {
 
     assert_eq!(profile_match.confidence, MatchConfidence::High);
     assert_eq!(profile_match.score, 120);
+}
+
+#[test]
+fn physical_dimensions_survive_as_a_matching_fallback() {
+    let current = parse_monitors_output(DESK).unwrap().remove(0);
+    let mut saved = ProfileMonitor::from(&current);
+    saved.id = "stale-id".to_owned();
+    saved.serial = "stale-serial".to_owned();
+    saved.description = "stale description".to_owned();
+
+    let (score, reason) = profile_monitor_match_score(&saved, &current);
+
+    assert_eq!(score, 50);
+    assert_eq!(reason, "make/model/physical size");
 }
 
 #[test]
@@ -258,6 +276,8 @@ fn global_mapping_preserves_an_exact_match_instead_of_greedily_consuming_it() {
                 make: String::new(),
                 model: String::new(),
                 serial: String::new(),
+                physical_width: 0,
+                physical_height: 0,
             },
             ProfileMonitor::from(&first),
         ],

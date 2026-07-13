@@ -205,6 +205,7 @@ fn install_systemd_user_dry_run_prints_service() {
     assert!(stdout.contains("Would write systemd user service"));
     assert!(stdout.contains("ExecStart="));
     assert!(stdout.contains("hyprdisjust"));
+    assert!(!stdout.contains("daemon --unattended"));
     assert!(!systemd_dir.path().join("hyprdisjust.service").exists());
 }
 
@@ -216,7 +217,12 @@ fn install_systemd_user_can_enable_and_start_with_fake_systemctl() {
     let output = hyprdisjust()
         .env("HYPRDISJUST_SYSTEMD_USER_DIR", systemd_dir.path())
         .env("PATH", fake_bin.path())
-        .args(["install-systemd-user", "--enable", "--start"])
+        .args([
+            "install-systemd-user",
+            "--enable",
+            "--start",
+            "--unattended",
+        ])
         .output()
         .unwrap();
 
@@ -227,6 +233,7 @@ fn install_systemd_user_can_enable_and_start_with_fake_systemctl() {
     );
     let service = fs::read_to_string(systemd_dir.path().join("hyprdisjust.service")).unwrap();
     assert!(service.contains("Restart=on-failure"));
+    assert!(service.contains("daemon --unattended"));
     let calls = fs::read_to_string(fake_bin.path().join("calls")).unwrap();
     assert!(calls.contains("--user enable hyprdisjust.service"));
     assert!(calls.contains("--user start hyprdisjust.service"));
@@ -325,12 +332,12 @@ fn daemon_once_dry_run_explains_selected_profile() {
 fn named_apply_skips_hyprctl_when_layout_is_already_active() {
     let config_dir = tempdir().unwrap();
     save_desk_profile(config_dir.path(), "desk");
-    let empty_path = tempdir().unwrap();
+    let fake_bin = fake_hyprctl(0, "ok\n", "");
 
     let output = hyprdisjust()
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
-        .env("PATH", empty_path.path())
+        .env("PATH", fake_bin.path())
         .args(["apply", "desk"])
         .output()
         .unwrap();
@@ -343,6 +350,59 @@ fn named_apply_skips_hyprctl_when_layout_is_already_active() {
     assert!(String::from_utf8(output.stdout)
         .unwrap()
         .contains("No changes: profile `desk` is already active"));
+    assert!(!fs::read_to_string(fake_bin.path().join("calls"))
+        .unwrap()
+        .contains("--batch"));
+}
+
+#[test]
+fn live_apply_ignores_the_monitor_fixture_environment() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+    let fake_bin = fake_hyprctl(0, "ok\n", "");
+    let laptop_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hyprctl-monitors-laptop.json");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", laptop_fixture)
+        .env("PATH", fake_bin.path())
+        .args(["apply", "desk", "--unattended"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("No changes: profile `desk` is already active"));
+    assert!(!fs::read_to_string(fake_bin.path().join("calls"))
+        .unwrap()
+        .contains("--batch"));
+}
+
+#[test]
+fn noninteractive_changed_apply_requires_explicit_unattended_flag() {
+    let config_dir = tempdir().unwrap();
+    save_desk_profile(config_dir.path(), "desk");
+    make_profile_non_noop(config_dir.path(), "desk");
+    let fake_bin = fake_hyprctl(0, "ok\n", "");
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
+        .env("PATH", fake_bin.path())
+        .args(["apply", "desk"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("interactive confirmation requires terminal"));
+    assert!(stderr.contains("--unattended"));
 }
 
 #[test]
@@ -469,13 +529,16 @@ fn unsafe_blackout_is_previewed_as_refused_and_cannot_be_exported() {
 fn apply_reports_warnings_before_live_apply_success() {
     let config_dir = tempdir().unwrap();
     save_overlapping_profile(config_dir.path(), "overlap");
-    let fake_bin = fake_hyprctl(0, "", "");
+    let after = include_str!("fixtures/hyprctl-monitors-desk.json")
+        .replacen("\"x\": 2560", "\"x\": 100", 1)
+        .replacen("\"y\": 240", "\"y\": 0", 1);
+    let fake_bin = fake_hyprctl_stateful(&after);
 
     let output = hyprdisjust()
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
         .env("PATH", fake_bin.path())
-        .args(["apply", "overlap"])
+        .args(["apply", "overlap", "--unattended"])
         .output()
         .unwrap();
 
@@ -506,7 +569,7 @@ fn apply_failure_preserves_hyprctl_stderr_details() {
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
         .env("PATH", fake_bin.path())
-        .args(["apply", "desk"])
+        .args(["apply", "desk", "--unattended"])
         .output()
         .unwrap();
 
@@ -532,7 +595,7 @@ fn apply_failure_preserves_hyprctl_stdout_errors() {
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
         .env("PATH", fake_bin.path())
-        .args(["apply", "desk"])
+        .args(["apply", "desk", "--unattended"])
         .output()
         .unwrap();
 
@@ -554,14 +617,14 @@ fn apply_failure_attempts_and_reports_successful_rollback() {
         .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
         .env("HYPRDISJUST_MONITORS_JSON", desk_fixture())
         .env("PATH", fake_bin.path())
-        .args(["apply", "desk"])
+        .args(["apply", "desk", "--unattended"])
         .output()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("synthetic first apply failure"));
-    assert!(stderr.contains("Hyprland accepted the rollback batch"));
+    assert!(stderr.contains("previous monitor layout was restored"));
     assert_eq!(
         fs::read_to_string(fake_bin.path().join("count"))
             .unwrap()
@@ -738,11 +801,56 @@ fn make_profile_non_noop(config_dir: &std::path::Path, name: &str) {
 fn fake_hyprctl(exit_code: i32, stdout: &str, stderr: &str) -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     let path = dir.path().join("hyprctl");
+    let monitors = dir.path().join("monitors.json");
+    let command_stdout = dir.path().join("stdout");
+    let command_stderr = dir.path().join("stderr");
+    let calls = dir.path().join("calls");
+    fs::write(
+        &monitors,
+        include_str!("fixtures/hyprctl-monitors-desk.json"),
+    )
+    .unwrap();
+    fs::write(&command_stdout, stdout).unwrap();
+    fs::write(&command_stderr, stderr).unwrap();
     let mut script = fs::File::create(&path).unwrap();
     writeln!(script, "#!/bin/sh").unwrap();
-    writeln!(script, "printf '%s' {:?}", stdout).unwrap();
-    writeln!(script, "printf '%s' {:?} >&2", stderr).unwrap();
+    writeln!(script, "printf '%s\\n' \"$*\" >> {:?}", calls).unwrap();
+    writeln!(script, "if [ \"$1\" = '-j' ]; then").unwrap();
+    writeln!(script, "  /bin/cat {:?}", monitors).unwrap();
+    writeln!(script, "  exit 0").unwrap();
+    writeln!(script, "fi").unwrap();
+    writeln!(script, "/bin/cat {:?}", command_stdout).unwrap();
+    writeln!(script, "/bin/cat {:?} >&2", command_stderr).unwrap();
     writeln!(script, "exit {exit_code}").unwrap();
+    drop(script);
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    dir
+}
+
+fn fake_hyprctl_stateful(after_monitors: &str) -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("hyprctl");
+    let before = dir.path().join("before.json");
+    let after = dir.path().join("after.json");
+    let applied = dir.path().join("applied");
+    fs::write(&before, include_str!("fixtures/hyprctl-monitors-desk.json")).unwrap();
+    fs::write(&after, after_monitors).unwrap();
+
+    let mut script = fs::File::create(&path).unwrap();
+    writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "if [ \"$1\" = '-j' ]; then").unwrap();
+    writeln!(script, "  if [ -f {:?} ]; then", applied).unwrap();
+    writeln!(script, "    /bin/cat {:?}", after).unwrap();
+    writeln!(script, "  else").unwrap();
+    writeln!(script, "    /bin/cat {:?}", before).unwrap();
+    writeln!(script, "  fi").unwrap();
+    writeln!(script, "  exit 0").unwrap();
+    writeln!(script, "fi").unwrap();
+    writeln!(script, ": > {:?}", applied).unwrap();
+    writeln!(script, "printf '%s\\n' ok").unwrap();
+    drop(script);
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
@@ -757,6 +865,7 @@ fn fake_systemctl() -> tempfile::TempDir {
     writeln!(script, "#!/bin/sh").unwrap();
     writeln!(script, "printf '%s\\n' \"$*\" >> {:?}", calls).unwrap();
     writeln!(script, "exit 0").unwrap();
+    drop(script);
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
@@ -767,8 +876,18 @@ fn fake_hyprctl_fail_then_ok() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     let path = dir.path().join("hyprctl");
     let count = dir.path().join("count");
+    let monitors = dir.path().join("monitors.json");
+    fs::write(
+        &monitors,
+        include_str!("fixtures/hyprctl-monitors-desk.json"),
+    )
+    .unwrap();
     let mut script = fs::File::create(&path).unwrap();
     writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "if [ \"$1\" = '-j' ]; then").unwrap();
+    writeln!(script, "  /bin/cat {:?}", monitors).unwrap();
+    writeln!(script, "  exit 0").unwrap();
+    writeln!(script, "fi").unwrap();
     writeln!(script, "count=0").unwrap();
     writeln!(script, "[ ! -f {:?} ] || read count < {:?}", count, count).unwrap();
     writeln!(script, "count=$((count + 1))").unwrap();
@@ -782,6 +901,7 @@ fn fake_hyprctl_fail_then_ok() -> tempfile::TempDir {
     writeln!(script, "  exit 1").unwrap();
     writeln!(script, "fi").unwrap();
     writeln!(script, "printf '%s\\n' ok").unwrap();
+    drop(script);
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();

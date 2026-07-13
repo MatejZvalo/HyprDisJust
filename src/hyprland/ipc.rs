@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::unix::fs::FileTypeExt;
@@ -110,10 +111,12 @@ pub fn socket2_path_from_env() -> anyhow::Result<PathBuf> {
         ));
     }
 
-    match env::var_os("HYPRLAND_INSTANCE_SIGNATURE") {
-        Some(signature) if !signature.is_empty() => Ok(socket2_path(runtime_dir, signature)),
-        _ => discover_socket2_path(&runtime_dir),
-    }
+    let signature = env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+    resolve_socket2_path_with(&runtime_dir, signature.as_deref(), |path| {
+        fs::metadata(path)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+    })
 }
 
 pub fn discover_socket2_path(runtime_dir: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
@@ -122,6 +125,29 @@ pub fn discover_socket2_path(runtime_dir: impl AsRef<Path>) -> anyhow::Result<Pa
             .map(|metadata| metadata.file_type().is_socket())
             .unwrap_or(false)
     })
+}
+
+pub fn resolve_socket2_path_with(
+    runtime_dir: impl AsRef<Path>,
+    signature: Option<&OsStr>,
+    is_socket: impl Fn(&Path) -> bool,
+) -> anyhow::Result<PathBuf> {
+    let runtime_dir = runtime_dir.as_ref();
+    if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+        let configured = socket2_path(runtime_dir, signature);
+        if is_socket(&configured) {
+            return Ok(configured);
+        }
+
+        return discover_socket2_path_with(runtime_dir, &is_socket).with_context(|| {
+            format!(
+                "configured Hyprland socket2 {} is unavailable and no unique live replacement could be discovered",
+                configured.display()
+            )
+        });
+    }
+
+    discover_socket2_path_with(runtime_dir, is_socket)
 }
 
 pub fn discover_socket2_path_with(
@@ -175,12 +201,25 @@ pub fn socket2_path(runtime_dir: impl Into<PathBuf>, signature: impl AsRef<Path>
 }
 
 pub fn parse_monitor_event(line: &str) -> Option<MonitorSocketEvent> {
-    let event_name = line.trim_end_matches(['\r', '\n']).split_once(">>")?.0;
+    let (event_name, payload) = line.trim_end_matches(['\r', '\n']).split_once(">>")?;
+    if payload.trim().is_empty() {
+        return None;
+    }
     match event_name {
         "monitoradded" => Some(MonitorSocketEvent::Added),
         "monitorremoved" => Some(MonitorSocketEvent::Removed),
-        "monitoraddedv2" => Some(MonitorSocketEvent::AddedV2),
-        "monitorremovedv2" => Some(MonitorSocketEvent::RemovedV2),
+        "monitoraddedv2" if valid_v2_monitor_payload(payload) => Some(MonitorSocketEvent::AddedV2),
+        "monitorremovedv2" if valid_v2_monitor_payload(payload) => {
+            Some(MonitorSocketEvent::RemovedV2)
+        }
         _ => None,
     }
+}
+
+fn valid_v2_monitor_payload(payload: &str) -> bool {
+    let mut fields = payload.split(',');
+    fields
+        .next()
+        .is_some_and(|id| id.trim().parse::<i64>().is_ok())
+        && fields.next().is_some_and(|name| !name.trim().is_empty())
 }

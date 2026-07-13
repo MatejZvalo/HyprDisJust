@@ -3,11 +3,10 @@ use std::env;
 use std::path::Path;
 
 use crate::config::{AppConfig, ConfigPaths};
-use crate::daemon::format_auto_apply_decision;
 use crate::hyprland::hyprctl::current_monitors;
 use crate::hyprland::ipc::socket2_path_from_env;
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::r#match::best_profile_match;
+use crate::profile::r#match::{best_profile_match, decide_auto_apply, format_auto_apply_decision};
 use crate::profile::store::ProfileStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,11 +148,8 @@ pub fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
             }
             if let (Some(store), Some(config)) = (&store, &config) {
                 let best_match = best_profile_match(store, &monitors);
-                let decision = crate::daemon::decide_auto_apply(
-                    store,
-                    &best_match,
-                    config.fallback_profile.as_deref(),
-                );
+                let decision =
+                    decide_auto_apply(store, &best_match, config.fallback_profile.as_deref());
                 let mut summary = format_auto_apply_decision(&decision, "Best profile");
                 if let Some(candidate) = best_match.candidates.first() {
                     summary.push_str(&format!(

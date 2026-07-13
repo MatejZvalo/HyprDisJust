@@ -47,6 +47,8 @@ pub fn render_monitor_rules(
                     make: String::new(),
                     model: String::new(),
                     serial: String::new(),
+                    physical_width: 0,
+                    physical_height: 0,
                 })
         })
         .collect();
@@ -191,13 +193,5 @@ fn escape_lua_string(value: &str) -> String {
 }
 
 fn format_number(value: f64) -> String {
-    if value.fract() == 0.0 {
-        return format!("{value:.0}");
-    }
-
-    let formatted = format!("{value:.3}");
-    formatted
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_owned()
+    value.to_string()
 }

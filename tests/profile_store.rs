@@ -84,7 +84,36 @@ fn profile_store_roundtrips_as_toml() {
     assert_eq!(loaded.profiles.len(), 1);
     assert_eq!(loaded.profiles[0].name, "desk");
     assert_eq!(loaded.profiles[0].monitors.len(), 2);
+    assert_eq!(loaded.profiles[0].monitors[0].physical_width, 600);
+    assert_eq!(loaded.profiles[0].monitors[0].physical_height, 340);
     assert_eq!(loaded.profiles[0].outputs[0].mode, "2560x1440@144");
+}
+
+#[test]
+fn legacy_profile_monitors_default_missing_physical_dimensions() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    fs::write(
+        &path,
+        r#"[[profiles]]
+name = "legacy"
+created_at = "a"
+updated_at = "a"
+
+[[profiles.monitors]]
+id = "acme:panel:123"
+name_hint = "DP-1"
+description = "Acme Panel"
+make = "Acme"
+model = "Panel"
+serial = "123"
+"#,
+    )
+    .unwrap();
+
+    let store = ProfileStore::load(path).unwrap();
+    assert_eq!(store.profiles[0].monitors[0].physical_width, 0);
+    assert_eq!(store.profiles[0].monitors[0].physical_height, 0);
 }
 
 #[test]

@@ -6,13 +6,17 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 
 use crate::config::{write_generated_file, AppConfig, ConfigPaths};
-use crate::daemon::{
-    decide_auto_apply, format_auto_apply_decision, AutoApplyDecision, DaemonOptions,
-};
-use crate::hyprland::hyprctl::current_monitors;
+use crate::daemon::DaemonOptions;
+use crate::hyprland::hyprctl::{current_monitors, live_monitors};
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::apply::{apply_plan, ensure_plan_safe_to_apply, plan_apply, ApplyPlan};
-use crate::profile::r#match::{best_profile_match, BestProfileMatch};
+use crate::profile::apply::{
+    apply_plan_safely, ensure_plan_safe_to_apply, plan_apply, ApplyOutcome, ApplyPlan,
+    TerminalConfirmation,
+};
+use crate::profile::r#match::{
+    best_profile_match, decide_auto_apply, format_auto_apply_decision, AutoApplyDecision,
+    BestProfileMatch,
+};
 use crate::profile::render::{format_hyprctl_batch_command, render_hyprland_lua};
 use crate::profile::store::Profile;
 use crate::profile::store::ProfileStore;
@@ -75,6 +79,9 @@ enum Commands {
         /// Explain what would be selected without changing monitor layout.
         #[arg(long)]
         dry_run: bool,
+        /// Apply without the 15-second confirmation rollback (for deliberate automation).
+        #[arg(long)]
+        unattended: bool,
     },
     /// Run the hotplug listener daemon.
     Daemon {
@@ -87,6 +94,9 @@ enum Commands {
         /// Append daemon logs to a file as well as stdout.
         #[arg(long)]
         log_file: Option<PathBuf>,
+        /// Apply without interactive confirmation (required for service/autostart use).
+        #[arg(long)]
+        unattended: bool,
     },
     /// Export generated Hyprland monitor configuration.
     Export {
@@ -109,6 +119,9 @@ enum Commands {
         /// Print the service that would be installed without writing files.
         #[arg(long)]
         dry_run: bool,
+        /// Add daemon --unattended to the service (explicitly bypass confirmation).
+        #[arg(long)]
+        unattended: bool,
     },
     /// Print shell completions.
     Completions {
@@ -161,15 +174,18 @@ pub fn run() -> anyhow::Result<()> {
             name,
             auto,
             dry_run,
-        } => run_apply(name.as_deref(), auto, dry_run)?,
+            unattended,
+        } => run_apply(name.as_deref(), auto, dry_run, unattended)?,
         Commands::Daemon {
             once,
             dry_run,
             log_file,
+            unattended,
         } => crate::daemon::run(DaemonOptions {
             once,
             dry_run,
             log_file,
+            unattended,
         })?,
         Commands::Export { name, format } => run_export(name.as_deref(), format)?,
         Commands::Tui => run_tui()?,
@@ -177,7 +193,8 @@ pub fn run() -> anyhow::Result<()> {
             enable,
             start,
             dry_run,
-        } => run_install_systemd_user(enable, start, dry_run)?,
+            unattended,
+        } => run_install_systemd_user(enable, start, dry_run, unattended)?,
         Commands::Completions { shell } => print!("{}", render_completions(shell)?),
     }
 
@@ -245,7 +262,12 @@ fn run_tui() -> anyhow::Result<()> {
     }
 }
 
-fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()> {
+fn run_apply(
+    name: Option<&str>,
+    auto: bool,
+    dry_run: bool,
+    unattended: bool,
+) -> anyhow::Result<()> {
     if name.is_some() && auto {
         bail!("pass either a profile name or --auto, not both");
     }
@@ -255,9 +277,13 @@ fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()
 
     if let Some(name) = name {
         let profile = profile_by_name(&store, name)?;
-        let monitors = current_monitors()?;
+        let monitors = if dry_run {
+            current_monitors()?
+        } else {
+            live_monitors()?
+        };
         let plan = plan_apply(profile, &monitors)?;
-        apply_or_print(&plan, &monitors, dry_run)?;
+        apply_or_print(&plan, &monitors, dry_run, unattended)?;
         return Ok(());
     }
 
@@ -265,7 +291,11 @@ fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()
         bail!("`apply` requires a profile name or --auto");
     }
 
-    let monitors = current_monitors()?;
+    let monitors = if dry_run {
+        current_monitors()?
+    } else {
+        live_monitors()?
+    };
     let config = AppConfig::load(paths.config_file_path())?;
     let best_match = best_profile_match(&store, &monitors);
 
@@ -287,7 +317,7 @@ fn run_apply(name: Option<&str>, auto: bool, dry_run: bool) -> anyhow::Result<()
 
     let profile = require_auto_profile(&store, &best_match, config.fallback_profile.as_deref())?;
     let plan = plan_apply(profile, &monitors)?;
-    apply_or_print(&plan, &monitors, dry_run)
+    apply_or_print(&plan, &monitors, dry_run, unattended)
 }
 
 fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
@@ -317,11 +347,17 @@ fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_install_systemd_user(enable: bool, start: bool, dry_run: bool) -> anyhow::Result<()> {
+fn run_install_systemd_user(
+    enable: bool,
+    start: bool,
+    dry_run: bool,
+    unattended: bool,
+) -> anyhow::Result<()> {
     let result = install_user_service(&SystemdInstallOptions {
         enable,
         start,
         dry_run,
+        unattended,
     })?;
 
     if dry_run {
@@ -337,6 +373,11 @@ fn run_install_systemd_user(enable: bool, start: bool, dry_run: bool) -> anyhow:
         "Installed systemd user service at {}.",
         result.service_path.display()
     );
+    if !unattended {
+        println!(
+            "Safety: service installed without --unattended; it will refuse changed layouts because no confirmation terminal is available."
+        );
+    }
     if result.enabled {
         println!("Enabled hyprdisjust.service.");
     }
@@ -379,6 +420,7 @@ fn apply_or_print(
     plan: &ApplyPlan,
     previous_monitors: &[MonitorState],
     dry_run: bool,
+    unattended: bool,
 ) -> anyhow::Result<()> {
     if dry_run {
         println!("{}", format_apply_commands(plan));
@@ -387,28 +429,45 @@ fn apply_or_print(
 
     print_apply_warnings(plan);
 
-    if plan.is_noop {
-        println!(
-            "No changes: profile `{}` is already active.",
-            plan.profile_name
-        );
-        return Ok(());
-    }
-
-    if let Err(error) = apply_plan(plan) {
-        bail!(
+    let outcome = if unattended {
+        apply_plan_safely(plan, None)
+    } else {
+        let mut confirmation = TerminalConfirmation;
+        apply_plan_safely(plan, Some(&mut confirmation))
+    };
+    let outcome = outcome.map_err(|error| {
+        anyhow::anyhow!(
             "{error:#}\nPrevious layout:\n{}",
             format_doctor(previous_monitors)
-        );
-    }
+        )
+    })?;
 
-    println!(
-        "Applied profile `{}` with {} monitor rule{}.",
-        plan.profile_name,
-        plan.rules.len(),
-        if plan.rules.len() == 1 { "" } else { "s" }
-    );
+    print_apply_outcome(plan, &outcome);
     Ok(())
+}
+
+fn print_apply_outcome(plan: &ApplyPlan, outcome: &ApplyOutcome) {
+    let rule_count = plan.rules.len();
+    match outcome {
+        ApplyOutcome::Noop => println!(
+            "No changes: profile `{}` is already active.",
+            plan.profile_name
+        ),
+        ApplyOutcome::Confirmed => println!(
+            "Confirmed profile `{}` with {rule_count} monitor rule{}.",
+            plan.profile_name,
+            if rule_count == 1 { "" } else { "s" }
+        ),
+        ApplyOutcome::Unattended => println!(
+            "Applied profile `{}` with {rule_count} monitor rule{} without confirmation (--unattended).",
+            plan.profile_name,
+            if rule_count == 1 { "" } else { "s" }
+        ),
+        ApplyOutcome::RolledBack { reason } => println!(
+            "Profile `{}` was not confirmed ({reason}); previous monitor layout restored.",
+            plan.profile_name
+        ),
+    }
 }
 
 fn format_apply_commands(plan: &ApplyPlan) -> String {

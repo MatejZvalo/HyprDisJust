@@ -14,6 +14,7 @@ pub struct SystemdInstallOptions {
     pub enable: bool,
     pub start: bool,
     pub dry_run: bool,
+    pub unattended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub fn install_user_service(
     let service_dir = systemd_user_dir()?;
     let service_path = service_dir.join(SERVICE_NAME);
     let exe = env::current_exe().context("failed to determine current executable path")?;
-    let service_contents = render_user_service(&exe);
+    let service_contents = render_user_service(&exe, options.unattended);
 
     if !options.dry_run {
         fs::create_dir_all(&service_dir).with_context(|| {
@@ -62,10 +63,12 @@ pub fn install_user_service(
     })
 }
 
-pub fn render_user_service(exe: &Path) -> String {
+pub fn render_user_service(exe: &Path, unattended: bool) -> String {
+    let unattended_arg = if unattended { " --unattended" } else { "" };
     format!(
-        "[Unit]\nDescription=HyprDisJust monitor profile daemon\nAfter=graphical-session.target\n\n[Service]\nExecStart={} daemon\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
-        quote_systemd_arg(exe)
+        "[Unit]\nDescription=HyprDisJust monitor profile daemon\nAfter=graphical-session.target\n\n[Service]\nExecStart={} daemon{}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+        quote_systemd_arg(exe),
+        unattended_arg
     )
 }
 

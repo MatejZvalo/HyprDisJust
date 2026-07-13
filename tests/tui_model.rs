@@ -134,6 +134,30 @@ fn movement_marks_draft_dirty_and_apply_returns_shared_plan_effect() {
 }
 
 #[test]
+fn tui_replans_noop_decision_from_fresh_monitor_state() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = TuiApp::new(
+        store,
+        ConfigPaths::from_config_dir(temp.path()).unwrap(),
+        AppConfig::default(),
+        monitors.clone(),
+    )
+    .unwrap();
+    assert!(app.draft_apply_plan().unwrap().is_noop);
+
+    let mut changed = monitors;
+    changed[0].x += 20;
+    let fresh_plan = app.draft_apply_plan_for_monitors(changed).unwrap();
+
+    assert!(!fresh_plan.is_noop);
+}
+
+#[test]
 fn apply_with_warnings_requires_confirmation() {
     let monitors = parse_monitors_output(DESK).unwrap();
     let mut store = ProfileStore::default();

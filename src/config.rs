@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -106,6 +106,20 @@ pub fn write_generated_file(path: impl AsRef<Path>, contents: &str) -> anyhow::R
                 temp_path.display()
             )
         })?;
+        File::open(parent)
+            .with_context(|| {
+                format!(
+                    "generated file was replaced, but failed to open config directory {} for syncing",
+                    parent.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "generated file was replaced, but failed to sync config directory {}",
+                    parent.display()
+                )
+            })?;
         Ok(())
     })();
 

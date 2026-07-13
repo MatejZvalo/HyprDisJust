@@ -98,14 +98,16 @@ impl HyprctlClient {
 
 fn hyprctl_command() -> Command {
     let mut command = Command::new("hyprctl");
-    if env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
-        if let Ok(socket_path) = socket2_path_from_env() {
-            if let Some(signature) = socket_path.parent().and_then(|path| path.file_name()) {
-                command.env("HYPRLAND_INSTANCE_SIGNATURE", signature);
-            }
+    if let Ok(socket_path) = socket2_path_from_env() {
+        if let Some(signature) = socket_path.parent().and_then(|path| path.file_name()) {
+            command.env("HYPRLAND_INSTANCE_SIGNATURE", signature);
         }
     }
     command
+}
+
+pub fn live_monitors() -> anyhow::Result<Vec<MonitorState>> {
+    HyprctlClient.monitors_all()
 }
 
 pub fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
@@ -119,8 +121,7 @@ pub fn current_monitors() -> anyhow::Result<Vec<MonitorState>> {
         return parse_monitors_output(&contents);
     }
 
-    let client = HyprctlClient;
-    client.monitors_all()
+    live_monitors()
 }
 
 pub fn parse_monitors_output(stdout: &str) -> anyhow::Result<Vec<MonitorState>> {

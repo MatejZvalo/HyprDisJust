@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,10 @@ pub struct ProfileMonitor {
     pub make: String,
     pub model: String,
     pub serial: String,
+    #[serde(default)]
+    pub physical_width: i32,
+    #[serde(default)]
+    pub physical_height: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +108,20 @@ impl ProfileStore {
                     temp_path.display()
                 )
             })?;
+            File::open(parent)
+                .with_context(|| {
+                    format!(
+                        "profile store was replaced, but failed to open config directory {} for syncing",
+                        parent.display()
+                    )
+                })?
+                .sync_all()
+                .with_context(|| {
+                    format!(
+                        "profile store was replaced, but failed to sync config directory {}",
+                        parent.display()
+                    )
+                })?;
             Ok(())
         })();
 
@@ -195,18 +213,22 @@ impl ProfileStore {
         let prefix = if monitor_count <= 1 { "laptop" } else { "desk" };
         let base = format!("{prefix}-{monitor_count}-{plural}");
 
-        if !self.has_profile(&base) {
-            return base;
+        self.next_available_name(&base)
+    }
+
+    pub fn next_available_name(&self, base: &str) -> String {
+        if !self.has_profile(base) {
+            return base.to_owned();
         }
 
-        for suffix in 2.. {
+        let mut suffix = 2_u128;
+        loop {
             let candidate = format!("{base}-{suffix}");
             if !self.has_profile(&candidate) {
                 return candidate;
             }
+            suffix = suffix.saturating_add(1);
         }
-
-        unreachable!("infinite suffix search should always find an available profile name")
     }
 
     pub fn has_profile(&self, name: &str) -> bool {
@@ -323,6 +345,8 @@ impl From<&MonitorState> for ProfileMonitor {
             make: monitor.make.clone(),
             model: monitor.model.clone(),
             serial: monitor.serial.clone(),
+            physical_width: monitor.physical_width,
+            physical_height: monitor.physical_height,
         }
     }
 }

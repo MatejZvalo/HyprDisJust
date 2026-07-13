@@ -4,6 +4,7 @@ use crate::profile::store::{Profile, ProfileMonitor, ProfileStore};
 const EXACT_ID_SCORE: i32 = 100;
 const PHYSICAL_SERIAL_SCORE: i32 = 90;
 const DESCRIPTION_SCORE: i32 = 60;
+const PHYSICAL_SIZE_SCORE: i32 = 50;
 const MAKE_MODEL_SCORE: i32 = 45;
 const OUTPUT_NAME_SCORE: i32 = 20;
 pub const HIGH_CONFIDENCE_PAIR_SCORE: i32 = DESCRIPTION_SCORE;
@@ -59,6 +60,39 @@ pub struct BestProfileMatch {
     pub selected: Option<ProfileMatch>,
     pub candidates: Vec<ProfileMatch>,
     pub ambiguous: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoApplyDecision {
+    Apply {
+        profile_name: String,
+        confidence: String,
+        reason: String,
+    },
+    Ambiguous {
+        reason: String,
+    },
+    MissingFallback {
+        profile_name: String,
+    },
+    NoProfiles,
+    NotEligible {
+        reason: String,
+    },
+    NoMatch,
+}
+
+impl AutoApplyDecision {
+    pub fn profile_name(&self) -> Option<&str> {
+        match self {
+            Self::Apply { profile_name, .. } => Some(profile_name),
+            Self::Ambiguous { .. }
+            | Self::MissingFallback { .. }
+            | Self::NoProfiles
+            | Self::NotEligible { .. }
+            | Self::NoMatch => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +347,87 @@ pub fn best_profile_match(store: &ProfileStore, current: &[MonitorState]) -> Bes
     }
 }
 
+pub fn decide_auto_apply(
+    store: &ProfileStore,
+    best_match: &BestProfileMatch,
+    fallback_profile: Option<&str>,
+) -> AutoApplyDecision {
+    if store.profiles.is_empty() {
+        return AutoApplyDecision::NoProfiles;
+    }
+
+    if let Some(selected) = best_match
+        .selected
+        .as_ref()
+        .filter(|selected| selected.confidence.is_auto_apply_eligible())
+    {
+        return AutoApplyDecision::Apply {
+            profile_name: selected.profile_name.clone(),
+            confidence: selected.confidence.as_str().to_owned(),
+            reason: first_reason(&selected.reasons, "profile matched"),
+        };
+    }
+
+    if best_match.ambiguous {
+        return AutoApplyDecision::Ambiguous {
+            reason: best_ambiguous_reason(best_match),
+        };
+    }
+
+    if let Some(fallback_profile) = normalized_fallback_profile(fallback_profile) {
+        if store.has_profile(fallback_profile) {
+            return AutoApplyDecision::Apply {
+                profile_name: fallback_profile.to_owned(),
+                confidence: "fallback".to_owned(),
+                reason: "no exact or high-confidence match; fallback_profile is configured"
+                    .to_owned(),
+            };
+        }
+
+        return AutoApplyDecision::MissingFallback {
+            profile_name: fallback_profile.to_owned(),
+        };
+    }
+
+    if let Some(selected) = &best_match.selected {
+        return AutoApplyDecision::NotEligible {
+            reason: first_reason(
+                &selected.reasons,
+                "profile match is not eligible for automatic apply",
+            ),
+        };
+    }
+
+    AutoApplyDecision::NoMatch
+}
+
+pub fn format_auto_apply_decision(decision: &AutoApplyDecision, profile_label: &str) -> String {
+    match decision {
+        AutoApplyDecision::Apply {
+            profile_name,
+            confidence,
+            reason,
+        } => {
+            format!("{profile_label}: {profile_name}\nConfidence: {confidence}\nReason: {reason}")
+        }
+        AutoApplyDecision::Ambiguous { reason } => {
+            format!("{profile_label}: ambiguous\nConfidence: ambiguous\nReason: {reason}")
+        }
+        AutoApplyDecision::MissingFallback { profile_name } => format!(
+            "{profile_label}: none\nConfidence: none\nReason: fallback_profile `{profile_name}` does not exist"
+        ),
+        AutoApplyDecision::NoProfiles => {
+            format!("{profile_label}: none\nConfidence: none\nReason: no profiles saved")
+        }
+        AutoApplyDecision::NotEligible { reason } => {
+            format!("{profile_label}: none\nConfidence: none\nReason: {reason}")
+        }
+        AutoApplyDecision::NoMatch => {
+            format!("{profile_label}: none\nConfidence: none\nReason: no useful profile match")
+        }
+    }
+}
+
 fn compare_profile_matches(left: &ProfileMatch, right: &ProfileMatch) -> std::cmp::Ordering {
     right
         .confidence
@@ -364,6 +479,10 @@ pub fn profile_monitor_match_score(
         return (DESCRIPTION_SCORE, "exact description");
     }
 
+    if same_make_model(profile_monitor, current) && same_physical_size(profile_monitor, current) {
+        return (PHYSICAL_SIZE_SCORE, "make/model/physical size");
+    }
+
     if same_make_model(profile_monitor, current) {
         return (MAKE_MODEL_SCORE, "make/model");
     }
@@ -382,6 +501,13 @@ fn same_make_model(profile_monitor: &ProfileMonitor, current: &MonitorState) -> 
         && profile_monitor.model == current.model
 }
 
+fn same_physical_size(profile_monitor: &ProfileMonitor, current: &MonitorState) -> bool {
+    profile_monitor.physical_width > 0
+        && profile_monitor.physical_height > 0
+        && profile_monitor.physical_width == current.physical_width
+        && profile_monitor.physical_height == current.physical_height
+}
+
 fn profile_monitor_label(profile_monitor: &ProfileMonitor) -> String {
     if useful(&profile_monitor.name_hint) {
         return profile_monitor.name_hint.clone();
@@ -392,4 +518,28 @@ fn profile_monitor_label(profile_monitor: &ProfileMonitor) -> String {
 
 fn useful(value: &str) -> bool {
     !value.trim().is_empty() && slug_component(value) != "unknown"
+}
+
+fn normalized_fallback_profile(fallback_profile: Option<&str>) -> Option<&str> {
+    fallback_profile
+        .map(str::trim)
+        .filter(|fallback_profile| !fallback_profile.is_empty())
+}
+
+fn best_ambiguous_reason(best_match: &BestProfileMatch) -> String {
+    best_match
+        .candidates
+        .first()
+        .and_then(|candidate| candidate.reasons.first())
+        .map(String::as_str)
+        .unwrap_or("multiple profiles or monitors matched equally")
+        .to_owned()
+}
+
+fn first_reason(reasons: &[String], fallback: &str) -> String {
+    reasons
+        .first()
+        .map(String::as_str)
+        .unwrap_or(fallback)
+        .to_owned()
 }
