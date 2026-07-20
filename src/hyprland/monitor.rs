@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use anyhow::bail;
+
+pub const MAX_CURRENT_MONITORS: usize = 32;
+pub const MAX_AVAILABLE_MODES_PER_MONITOR: usize = 256;
+const MAX_MONITOR_TEXT_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RawHyprMonitor {
     pub id: i64,
@@ -53,8 +59,101 @@ pub struct MonitorState {
     pub physical_height: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProvenance {
+    PhysicalSerial,
+    PhysicalNoSerial,
+    Description,
+    ConnectorFallback,
+    ConnectorDisambiguated,
+    LegacyUntrusted,
+}
+
+impl MonitorState {
+    pub fn identity_provenance(&self) -> IdentityProvenance {
+        infer_identity_provenance(
+            &self.id,
+            &self.make,
+            &self.model,
+            &self.serial,
+            &self.description,
+        )
+    }
+}
+
+pub fn infer_identity_provenance(
+    id: &str,
+    make: &str,
+    model: &str,
+    serial: &str,
+    description: &str,
+) -> IdentityProvenance {
+    let expected = stable_monitor_id(make, model, serial, description, "");
+    if id == expected {
+        if expected.starts_with("output:") {
+            IdentityProvenance::ConnectorFallback
+        } else if useful(make) && useful(model) && useful(serial) {
+            IdentityProvenance::PhysicalSerial
+        } else if useful(make) && useful(model) {
+            IdentityProvenance::PhysicalNoSerial
+        } else if useful(description) {
+            IdentityProvenance::Description
+        } else {
+            IdentityProvenance::LegacyUntrusted
+        }
+    } else if expected != "output:unknown"
+        && id
+            .strip_prefix(&expected)
+            .is_some_and(|suffix| suffix.starts_with(":output:") && suffix.len() > 8)
+    {
+        IdentityProvenance::ConnectorDisambiguated
+    } else if id.starts_with("output:") {
+        IdentityProvenance::ConnectorFallback
+    } else {
+        IdentityProvenance::LegacyUntrusted
+    }
+}
+
 pub fn parse_raw_monitors(json: &str) -> anyhow::Result<Vec<RawHyprMonitor>> {
-    Ok(serde_json::from_str(json)?)
+    let monitors: Vec<RawHyprMonitor> = serde_json::from_str(json)?;
+    validate_raw_monitors(&monitors)?;
+    Ok(monitors)
+}
+
+pub fn validate_raw_monitors(monitors: &[RawHyprMonitor]) -> anyhow::Result<()> {
+    if monitors.len() > MAX_CURRENT_MONITORS {
+        bail!("monitor topology has more than the maximum {MAX_CURRENT_MONITORS} outputs");
+    }
+    for monitor in monitors {
+        if monitor.available_modes.len() > MAX_AVAILABLE_MODES_PER_MONITOR {
+            bail!(
+                "output `{}` advertises more than the maximum {MAX_AVAILABLE_MODES_PER_MONITOR} modes",
+                monitor.name
+            );
+        }
+        for (label, value) in [
+            ("name", monitor.name.as_str()),
+            ("description", monitor.description.as_str()),
+            ("make", monitor.make.as_str()),
+            ("model", monitor.model.as_str()),
+            ("serial", monitor.serial.as_str()),
+        ] {
+            if value.len() > MAX_MONITOR_TEXT_BYTES {
+                bail!("output monitor {label} is longer than {MAX_MONITOR_TEXT_BYTES} bytes");
+            }
+        }
+        if monitor
+            .available_modes
+            .iter()
+            .any(|mode| mode.len() > MAX_MONITOR_TEXT_BYTES)
+        {
+            bail!(
+                "output `{}` advertises an oversized mode string",
+                monitor.name
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn normalize_monitors(raw_monitors: Vec<RawHyprMonitor>) -> Vec<MonitorState> {

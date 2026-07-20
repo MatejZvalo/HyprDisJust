@@ -18,6 +18,8 @@ Run `doctor` first. It prints Hyprland session status, config paths, saved
 profile count, generated config paths, socket2 availability, stale output-name
 hints, systemd installation guidance, and the best automatic profile decision
 with its score and reason.
+It exits nonzero when any check has error severity; a successful empty query is
+reported as a detected Hyprland session with zero monitors.
 
 ## Status
 
@@ -71,9 +73,12 @@ state, and restores the captured layout if execution or verification fails.
 Already-active plans are detected before execution, so CLI and daemon runs do
 not needlessly reapply the same effective layout.
 
-Every live mutation ignores `HYPRDISJUST_MONITORS_JSON`, queries the compositor
-directly, rebuilds the complete plan from the topology captured immediately
-before apply, and verifies both the result and any rollback. The fixture
+Every live mutation ignores `HYPRDISJUST_MONITORS_JSON` and enters one per-user
+serialized transaction before querying the compositor. Automatic selection is
+repeated under that lock, and the lock remains held through planning, apply,
+convergence, confirmation, verification, and rollback. Verification rejects
+added, removed, renamed, or identity-changed outputs as topology drift and uses
+a bounded convergence window of roughly three seconds. The fixture
 environment variable remains available for read-only CLI and save tests only.
 
 After a changed layout is applied, HyprDisJust shows a 15-second countdown.
@@ -90,7 +95,10 @@ mode, position, scale, and transform before disabling it again. This prevents a
 disable-only rollback from retaining settings introduced by the rejected layout.
 
 Automatic matching uses a deterministic global one-to-one mapping. Exact
-stable IDs win; an exact description is the minimum high-confidence physical
+stable physical IDs win; connector-only and connector-disambiguated IDs can
+assist an explicit named apply but are never exact or auto-apply eligible. Raw
+physical fields must corroborate an exact ID so lossy ID slug collisions cannot
+be promoted to exact matches. An exact description is the minimum high-confidence physical
 match. Every profile monitor and current monitor must participate for an exact
 or high-confidence automatic match. Output-name-only and incomplete matches are
 never auto-applied. Any equally good monitor or profile mapping is reported as
@@ -150,7 +158,8 @@ match is found. It is not used to bypass an ambiguous match. Unknown config
 keys are rejected so spelling mistakes do not silently change behavior.
 
 The daemon waits `debounce_ms` after monitor hot-plug events before querying
-Hyprland again. `apply_on_start` is disabled by default so starting the daemon
+Hyprland again. Values are limited to `0..=60000`; zero disables debounce.
+`apply_on_start` is disabled by default so starting the daemon
 does not immediately change monitor layout. Event bursts reset the debounce
 deadline. Unrelated and malformed socket2 lines are ignored. Exact or eligible
 high-confidence matches are applied; ambiguous, missing, and ineligible matches
@@ -160,6 +169,9 @@ to break self-generated event loops. Socket disconnects and connection failures
 are logged, retried after two seconds, and reconciled after reconnect. If an
 inherited `HYPRLAND_INSTANCE_SIGNATURE` becomes stale, a uniquely discoverable
 live socket replaces it for socket2 and `hyprctl` operations.
+Socket discovery requires a connectable, user-owned instance; stale socket
+inodes, unsafe signature components, symlinked instance directories, oversized
+events, and invalid UTF-8 frames are rejected.
 
 `apply_on_start` does not bypass safety. A foreground daemon can ask for the
 15-second confirmation, but a service normally has no terminal and therefore
@@ -277,6 +289,14 @@ When the instance signature is absent but exactly one socket2 instance exists,
 HyprDisJust discovers it for both the daemon and `hyprctl`. systemd is optional
 and needed only for user-service installation.
 
+Profile/config inputs and subprocess output are size-bounded. Profile CRUD is
+serialized through `profiles.lock`, reloads under the lock, validates the full
+candidate store, and atomically replaces private `0600` data. Generated files
+and systemd units use the same symlink-safe atomic replacement path. External
+commands have operation-specific deadlines and capped stdout/stderr retention.
+Optional daemon file logging rotates continuously at 1 MiB and retains one
+archive; systemd deployments can omit `--log-file` and use journald.
+
 ## MVP Limitations
 
 - Export currently targets Hyprland's Lua `hl.monitor(...)` configuration path;
@@ -288,4 +308,4 @@ and needed only for user-service installation.
 
 ## License
 
-No license for now.
+HyprDisJust is distributed under the [MIT License](LICENSE).

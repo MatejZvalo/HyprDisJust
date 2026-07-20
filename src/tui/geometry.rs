@@ -1,5 +1,7 @@
 use ratatui::layout::Rect;
 
+use crate::hyprland::monitor::MonitorState;
+use crate::profile::apply::resolved_mode_dimensions;
 use crate::profile::store::ProfileOutput;
 
 pub const TERMINAL_CELL_ASPECT_RATIO: f64 = 2.0;
@@ -22,7 +24,10 @@ pub struct LogicalRect {
 
 impl LogicalRect {
     pub fn contains(self, x: i32, y: i32) -> bool {
-        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+        x >= self.x
+            && x < self.x.saturating_add(self.width)
+            && y >= self.y
+            && y < self.y.saturating_add(self.height)
     }
 }
 
@@ -36,7 +41,15 @@ pub struct CanvasTransform {
 
 impl CanvasTransform {
     pub fn new(outputs: &[ProfileOutput], area: Rect) -> Self {
-        let mut bounds = layout_bounds(outputs).unwrap_or(LogicalRect {
+        Self::new_with_monitors(outputs, &[], area)
+    }
+
+    pub fn new_with_monitors(
+        outputs: &[ProfileOutput],
+        monitors: &[MonitorState],
+        area: Rect,
+    ) -> Self {
+        let mut bounds = layout_bounds(outputs, monitors).unwrap_or(LogicalRect {
             x: 0,
             y: 0,
             width: 1920,
@@ -73,8 +86,14 @@ impl CanvasTransform {
             };
         }
 
-        let x = self.area.x + scaled_offset(rect.x - self.bounds.x, self.cell_width);
-        let y = self.area.y + scaled_offset(rect.y - self.bounds.y, self.cell_height);
+        let x = self.area.x.saturating_add(scaled_offset(
+            rect.x.saturating_sub(self.bounds.x),
+            self.cell_width,
+        ));
+        let y = self.area.y.saturating_add(scaled_offset(
+            rect.y.saturating_sub(self.bounds.y),
+            self.cell_height,
+        ));
         let width = scaled_size(rect.width, self.cell_width, self.area.width);
         let height = scaled_size(rect.height, self.cell_height, self.area.height);
         let (x, width) = clamp_span_to_area(x, width, self.area.x, self.area.width);
@@ -97,8 +116,12 @@ impl CanvasTransform {
             return None;
         }
 
-        let x = self.bounds.x + ((column - self.area.x) as f64 * self.cell_width).round() as i32;
-        let y = self.bounds.y + ((row - self.area.y) as f64 * self.cell_height).round() as i32;
+        let x = self.bounds.x.saturating_add(
+            (f64::from(column.saturating_sub(self.area.x)) * self.cell_width).round() as i32,
+        );
+        let y = self.bounds.y.saturating_add(
+            (f64::from(row.saturating_sub(self.area.y)) * self.cell_height).round() as i32,
+        );
         Some((x, y))
     }
 
@@ -110,13 +133,23 @@ impl CanvasTransform {
     }
 
     pub fn output_at(self, outputs: &[ProfileOutput], column: u16, row: u16) -> Option<usize> {
+        self.output_at_with_monitors(outputs, &[], column, row)
+    }
+
+    pub fn output_at_with_monitors(
+        self,
+        outputs: &[ProfileOutput],
+        monitors: &[MonitorState],
+        column: u16,
+        row: u16,
+    ) -> Option<usize> {
         let (x, y) = self.to_logical(column, row)?;
         outputs
             .iter()
             .enumerate()
             .rev()
             .find_map(|(index, output)| {
-                output_rect(output)
+                output_rect_with_monitors(output, monitors)
                     .filter(|rect| rect.contains(x, y))
                     .map(|_| index)
             })
@@ -124,11 +157,23 @@ impl CanvasTransform {
 }
 
 pub fn output_rect(output: &ProfileOutput) -> Option<LogicalRect> {
+    output_rect_with_monitors(output, &[])
+}
+
+pub fn output_rect_with_monitors(
+    output: &ProfileOutput,
+    monitors: &[MonitorState],
+) -> Option<LogicalRect> {
     if !output.enabled {
         return None;
     }
 
-    let (mut width, mut height) = parse_mode_dimensions(&output.mode)?;
+    let (mut width, mut height) = parse_mode_dimensions(&output.mode).or_else(|| {
+        let monitor = monitors
+            .iter()
+            .find(|monitor| monitor.id == output.monitor_id)?;
+        resolved_mode_dimensions(&output.mode, monitor).ok()
+    })?;
     if matches!(output.transform, 1 | 3 | 5 | 7) {
         std::mem::swap(&mut width, &mut height);
     }
@@ -145,10 +190,13 @@ pub fn output_rect(output: &ProfileOutput) -> Option<LogicalRect> {
     })
 }
 
-pub fn move_output(output: &mut ProfileOutput, dx: i32, dy: i32) {
+pub fn move_output(output: &mut ProfileOutput, dx: i32, dy: i32) -> bool {
     if output.enabled {
         output.x = output.x.saturating_add(dx);
         output.y = output.y.saturating_add(dy);
+        true
+    } else {
+        false
     }
 }
 
@@ -158,69 +206,96 @@ pub fn snap_output(
     target_index: usize,
     direction: SnapDirection,
 ) -> bool {
+    snap_output_with_monitors(outputs, &[], selected_index, target_index, direction)
+}
+
+pub fn snap_output_with_monitors(
+    outputs: &mut [ProfileOutput],
+    monitors: &[MonitorState],
+    selected_index: usize,
+    target_index: usize,
+    direction: SnapDirection,
+) -> bool {
     if selected_index == target_index {
         return false;
     }
 
-    let Some(selected_rect) = outputs.get(selected_index).and_then(output_rect) else {
+    let Some(selected_rect) = outputs
+        .get(selected_index)
+        .and_then(|output| output_rect_with_monitors(output, monitors))
+    else {
         return false;
     };
-    let Some(target_rect) = outputs.get(target_index).and_then(output_rect) else {
+    let Some(target_rect) = outputs
+        .get(target_index)
+        .and_then(|output| output_rect_with_monitors(output, monitors))
+    else {
         return false;
     };
 
     let selected = &mut outputs[selected_index];
     match direction {
         SnapDirection::Left => {
-            selected.x = target_rect.x - selected_rect.width;
+            selected.x = target_rect.x.saturating_sub(selected_rect.width);
             selected.y = target_rect.y;
         }
         SnapDirection::Right => {
-            selected.x = target_rect.x + target_rect.width;
+            selected.x = target_rect.x.saturating_add(target_rect.width);
             selected.y = target_rect.y;
         }
         SnapDirection::Above => {
             selected.x = target_rect.x;
-            selected.y = target_rect.y - selected_rect.height;
+            selected.y = target_rect.y.saturating_sub(selected_rect.height);
         }
         SnapDirection::Below => {
             selected.x = target_rect.x;
-            selected.y = target_rect.y + target_rect.height;
+            selected.y = target_rect.y.saturating_add(target_rect.height);
         }
     }
 
     true
 }
 
-fn layout_bounds(outputs: &[ProfileOutput]) -> Option<LogicalRect> {
-    let rects: Vec<_> = outputs.iter().filter_map(output_rect).collect();
+fn layout_bounds(outputs: &[ProfileOutput], monitors: &[MonitorState]) -> Option<LogicalRect> {
+    let rects: Vec<_> = outputs
+        .iter()
+        .filter_map(|output| output_rect_with_monitors(output, monitors))
+        .collect();
     let first = rects.first()?;
     let mut left = first.x.min(0);
     let mut top = first.y.min(0);
-    let mut total_width = 0;
-    let mut total_height = 0;
-    let mut widest = 0;
-    let mut tallest = 0;
+    let mut right = first.x.saturating_add(first.width).max(0);
+    let mut bottom = first.y.saturating_add(first.height).max(0);
 
     for rect in &rects {
         left = left.min(rect.x);
         top = top.min(rect.y);
-        total_width += rect.width;
-        total_height += rect.height;
-        widest = widest.max(rect.width);
-        tallest = tallest.max(rect.height);
+        right = right.max(rect.x.saturating_add(rect.width));
+        bottom = bottom.max(rect.y.saturating_add(rect.height));
     }
 
-    let logical_width = total_width.max(widest).max(1);
-    let logical_height = total_height.max(tallest).max(1);
+    let logical_width = if rects.len() == 1 {
+        first.width.max(1)
+    } else {
+        right.saturating_sub(left).max(1)
+    };
+    let logical_height = if rects.len() == 1 {
+        first.height.max(1)
+    } else {
+        bottom.saturating_sub(top).max(1)
+    };
     let padding_x = (logical_width / 20).max(80);
     let padding_y = (logical_height / 20).max(80);
 
     Some(LogicalRect {
-        x: left - padding_x,
-        y: top - padding_y,
-        width: (logical_width + padding_x * 2).max(1),
-        height: (logical_height + padding_y * 2).max(1),
+        x: left.saturating_sub(padding_x),
+        y: top.saturating_sub(padding_y),
+        width: logical_width
+            .saturating_add(padding_x.saturating_mul(2))
+            .max(1),
+        height: logical_height
+            .saturating_add(padding_y.saturating_mul(2))
+            .max(1),
     })
 }
 

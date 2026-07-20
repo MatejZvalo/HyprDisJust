@@ -7,6 +7,7 @@
   availability, profile count, monitor identities, stale output-name hints,
   systemd guidance, and the best automatic profile decision with score and
   refusal reason.
+  Returns a nonzero status if any diagnostic has error severity.
 
 ## Profiles
 
@@ -37,7 +38,7 @@
 
 ## Daemon
 
-- `hyprdisjust daemon [--unattended]`
+- `hyprdisjust daemon [--unattended] [--log-file PATH]`
   Watches Hyprland socket2 monitor events and auto-applies eligible profiles.
   Monitor-event bursts are debounced, unrelated events are ignored, malformed
   lines do not trigger applies, disconnects reconnect, and active layouts are
@@ -46,6 +47,10 @@
   self-generated event loops. Without `--unattended`, every changed apply
   requires the same 15-second interactive confirmation and non-terminal
   sessions refuse before changing outputs.
+  `--log-file` appends sanitized `0600` logs to a file in a private directory.
+  The active file rotates at 1 MiB to a single `.log.1` archive, bounding retained
+  file logs to roughly 2 MiB; without this option output is written only to
+  stdout/stderr (and therefore normally captured by journald under systemd).
 - `hyprdisjust daemon --once --dry-run`
   Runs one automatic decision and prints the generated command.
 - `hyprdisjust install-systemd-user [--enable] [--start] [--dry-run] [--unattended]`
@@ -78,17 +83,26 @@ state is restored when the editor exits. Changed TUI applies use the same
 
 Matching is physical-identity first and globally one-to-one. Exact IDs outrank
 exact descriptions; make/model and output-name-only matches remain partial.
-Enabled and disabled outputs require a valid mode, positive finite scale,
-transform `0..=7`, unique monitor IDs, and consistent output mappings. An apply
+Connector-only and connector-disambiguated IDs never qualify as exact or for
+automatic apply, and raw physical fields must corroborate exact IDs.
+Enabled and disabled outputs require a concrete `WIDTHxHEIGHT@REFRESH` mode or
+`preferred`, `highres`, `highrr`, or `maxwidth`; scale must be in `0.1..=10.0`
+and produce whole logical pixels. Transform must be `0..=7`, monitor IDs must be
+unique, and output mappings must be consistent. An apply
 that would disable every saved output is refused. Active outputs are configured
 before obsolete outputs are disabled, then the resulting state is verified; a
 failure triggers a captured-layout rollback attempt. Rollback is also verified
 against the exact normalized state captured before apply. Previously disabled
 outputs have their captured mode, position, scale, and transform restored before
 their disabled state is reinstated.
+All live applies are serialized from the authoritative monitor query through
+confirmation or rollback. Verification checks the complete output set and
+identity, and allows bounded backoff for delayed modesets.
 
 ## Shells
 
 - `hyprdisjust completions bash`
+- `hyprdisjust completions elvish`
 - `hyprdisjust completions zsh`
 - `hyprdisjust completions fish`
+- `hyprdisjust completions powershell`

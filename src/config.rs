@@ -1,15 +1,17 @@
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::ErrorKind;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use directories::BaseDirs;
 use serde::Deserialize;
 
+use crate::atomic::{atomic_write, ensure_private_directory, read_limited, PRIVATE_FILE_MODE};
+use crate::profile::validation::validate_profile_name;
+
 const CONFIG_DIR_ENV: &str = "HYPRDISJUST_CONFIG_DIR";
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigPaths {
@@ -73,79 +75,35 @@ impl ConfigPaths {
 
 pub fn write_generated_file(path: impl AsRef<Path>, contents: &str) -> anyhow::Result<()> {
     let path = path.as_ref();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create generated config directory {}",
-            parent.display()
-        )
-    })?;
-
-    let temp_path = unique_temp_path(path);
-    let write_result = (|| -> anyhow::Result<()> {
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary generated file {}",
-                    temp_path.display()
-                )
-            })?;
-        temp_file
-            .write_all(contents.as_bytes())
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        temp_file
-            .sync_all()
-            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "failed to replace generated file {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
-        File::open(parent)
-            .with_context(|| {
-                format!(
-                    "generated file was replaced, but failed to open config directory {} for syncing",
-                    parent.display()
-                )
-            })?
-            .sync_all()
-            .with_context(|| {
-                format!(
-                    "generated file was replaced, but failed to sync config directory {}",
-                    parent.display()
-                )
-            })?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-
-    write_result
+    atomic_write(path, contents.as_bytes(), PRIVATE_FILE_MODE)
+        .with_context(|| format!("failed to write generated file {}", path.display()))
 }
 
 impl AppConfig {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read config at {}", path.display()));
+        if let Err(error) = fs::symlink_metadata(path) {
+            if error.kind() == ErrorKind::NotFound {
+                return Ok(Self::default());
             }
-        };
+            return Err(error)
+                .with_context(|| format!("failed to inspect config at {}", path.display()));
+        }
+        ensure_private_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        let contents = read_limited(path, MAX_CONFIG_BYTES, "config")?;
+        let contents = std::str::from_utf8(&contents)
+            .with_context(|| format!("config at {} is not valid UTF-8", path.display()))?;
 
-        let config: Self = toml::from_str(&contents)
+        let config: Self = toml::from_str(contents)
             .with_context(|| format!("failed to parse config at {}", path.display()))?;
         if !(1..=10_000).contains(&config.tui_move_step) {
             bail!("tui_move_step must be between 1 and 10000");
+        }
+        if config.debounce_ms > 60_000 {
+            bail!("debounce_ms must be between 0 and 60000 (zero disables debounce)");
+        }
+        if let Some(fallback_profile) = config.fallback_profile.as_deref() {
+            validate_profile_name(fallback_profile).context("invalid fallback_profile")?;
         }
         Ok(config)
     }
@@ -168,17 +126,4 @@ fn default_debounce_ms() -> u64 {
 
 fn default_tui_move_step() -> i32 {
     20
-}
-
-fn unique_temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("generated");
-    let process_id = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_file_name(format!(".{file_name}.{process_id}.{nanos}.tmp"))
 }

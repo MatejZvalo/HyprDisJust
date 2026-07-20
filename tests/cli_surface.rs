@@ -50,6 +50,17 @@ fn help_lists_bootstrap_command_surface() {
 }
 
 #[test]
+fn version_reports_v1_release() {
+    let output = hyprdisjust().arg("--version").output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "hyprdisjust 1.0.0"
+    );
+}
+
+#[test]
 fn completions_prints_shell_completion_script() {
     let output = hyprdisjust()
         .args(["completions", "bash"])
@@ -60,6 +71,41 @@ fn completions_prints_shell_completion_script() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("complete -F _hyprdisjust"));
     assert!(stdout.contains("install-systemd-user"));
+}
+
+#[test]
+fn doctor_distinguishes_a_successful_empty_query_from_detection_failure() {
+    let config_dir = tempdir().unwrap();
+    let fixture = config_dir.path().join("empty.json");
+    fs::write(&fixture, "[]").unwrap();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("HYPRDISJUST_MONITORS_JSON", fixture)
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Hyprland: detected\nMonitors: 0"));
+}
+
+#[test]
+fn doctor_exits_nonzero_when_hyprctl_is_missing() {
+    let config_dir = tempdir().unwrap();
+    let empty_path = tempdir().unwrap();
+
+    let output = hyprdisjust()
+        .env("HYPRDISJUST_CONFIG_DIR", config_dir.path())
+        .env("PATH", empty_path.path())
+        .env_remove("HYPRDISJUST_MONITORS_JSON")
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[error] hyprctl monitors"));
 }
 
 #[test]
@@ -324,7 +370,7 @@ fn daemon_once_dry_run_explains_selected_profile() {
     assert!(stdout.contains("Dry run: monitor layout was not changed"));
     assert!(stdout.contains("No changes: selected profile is already active"));
     assert!(stdout.contains(
-        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", disabled = false, mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", disabled = false, mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1, transform = 0 })\""
+        "hyprctl --batch 'eval hl.monitor({ output = \"DP-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })'"
     ));
 }
 

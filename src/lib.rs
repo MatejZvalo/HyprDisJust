@@ -1,8 +1,11 @@
+pub mod atomic;
 pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod hyprland;
+pub mod process;
 pub mod profile;
 pub mod systemd;
+pub mod text;
 pub mod tui;

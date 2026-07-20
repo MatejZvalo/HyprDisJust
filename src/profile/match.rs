@@ -1,13 +1,23 @@
-use crate::hyprland::monitor::{slug_component, MonitorState};
+use crate::hyprland::monitor::{
+    infer_identity_provenance, slug_component, IdentityProvenance, MonitorState,
+};
 use crate::profile::store::{Profile, ProfileMonitor, ProfileStore};
+use crate::text::sanitize_terminal_text;
 
 const EXACT_ID_SCORE: i32 = 100;
+const CORROBORATED_LEGACY_ID_SCORE: i32 = 95;
 const PHYSICAL_SERIAL_SCORE: i32 = 90;
 const DESCRIPTION_SCORE: i32 = 60;
 const PHYSICAL_SIZE_SCORE: i32 = 50;
 const MAKE_MODEL_SCORE: i32 = 45;
 const OUTPUT_NAME_SCORE: i32 = 20;
 pub const HIGH_CONFIDENCE_PAIR_SCORE: i32 = DESCRIPTION_SCORE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorMatchMode {
+    Automatic,
+    Explicit,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchConfidence {
@@ -107,14 +117,26 @@ pub fn resolve_monitor_matches(
     profile_monitors: &[ProfileMonitor],
     current: &[MonitorState],
 ) -> Vec<Option<ResolvedMonitorMatch>> {
+    resolve_monitor_matches_with_mode(profile_monitors, current, MonitorMatchMode::Automatic)
+}
+
+pub fn resolve_monitor_matches_with_mode(
+    profile_monitors: &[ProfileMonitor],
+    current: &[MonitorState],
+    mode: MonitorMatchMode,
+) -> Vec<Option<ResolvedMonitorMatch>> {
     if profile_monitors.is_empty() {
         return Vec::new();
     }
 
+    let tie_breaker_multiplier = i64::try_from(profile_monitors.len())
+        .unwrap_or(i64::MAX / 1_000)
+        .saturating_add(1);
     let match_bonus = i64::try_from(profile_monitors.len())
         .unwrap_or(i64::MAX / 1_000)
         .saturating_mul(i64::from(EXACT_ID_SCORE))
-        .saturating_add(1);
+        .saturating_add(1)
+        .saturating_mul(tie_breaker_multiplier);
     let scores: Vec<Vec<_>> = profile_monitors
         .iter()
         .map(|profile_monitor| scored_pairs(profile_monitor, current))
@@ -125,7 +147,17 @@ pub fn resolve_monitor_matches(
             row.iter()
                 .map(|pair| {
                     if pair.score > 0 {
-                        match_bonus + i64::from(pair.score)
+                        let connector_tie_breaker =
+                            if mode == MonitorMatchMode::Explicit && pair.connector_match {
+                                1
+                            } else {
+                                0
+                            };
+                        match_bonus
+                            .saturating_add(
+                                i64::from(pair.score).saturating_mul(tie_breaker_multiplier),
+                            )
+                            .saturating_add(connector_tie_breaker)
                     } else {
                         0
                     }
@@ -265,7 +297,7 @@ pub fn match_profile(profile: &Profile, current: &[MonitorState]) -> ProfileMatc
         reasons.push(format!(
             "{} matched {} by {}",
             profile_monitor_label(profile_monitor),
-            current[resolved.current_index].output_name,
+            safe_display(&current[resolved.current_index].output_name),
             resolved.reason
         ));
     }
@@ -332,11 +364,10 @@ pub fn best_profile_match(store: &ProfileStore, current: &[MonitorState]) -> Bes
         .first()
         .map(|best| {
             best.confidence == MatchConfidence::Ambiguous
-                || (best.confidence.is_auto_apply_eligible()
-                    && candidates
-                        .iter()
-                        .skip(1)
-                        .any(|candidate| automatic_tie(best, candidate)))
+                || candidates
+                    .iter()
+                    .skip(1)
+                    .any(|candidate| profile_tie(best, candidate))
         })
         .unwrap_or(false);
 
@@ -438,16 +469,18 @@ fn compare_profile_matches(left: &ProfileMatch, right: &ProfileMatch) -> std::cm
         .then_with(|| left.profile_name.cmp(&right.profile_name))
 }
 
-fn automatic_tie(left: &ProfileMatch, right: &ProfileMatch) -> bool {
+fn profile_tie(left: &ProfileMatch, right: &ProfileMatch) -> bool {
     left.confidence == right.confidence
         && left.score == right.score
-        && right.confidence.is_auto_apply_eligible()
+        && left.matched_monitors == right.matched_monitors
+        && left.confidence != MatchConfidence::None
 }
 
 #[derive(Debug, Clone)]
 struct PairScore {
     score: i32,
     reason: &'static str,
+    connector_match: bool,
 }
 
 fn scored_pairs(profile_monitor: &ProfileMonitor, current: &[MonitorState]) -> Vec<PairScore> {
@@ -455,7 +488,12 @@ fn scored_pairs(profile_monitor: &ProfileMonitor, current: &[MonitorState]) -> V
         .iter()
         .map(|monitor| {
             let (score, reason) = profile_monitor_match_score(profile_monitor, monitor);
-            PairScore { score, reason }
+            PairScore {
+                score,
+                reason,
+                connector_match: useful(&profile_monitor.name_hint)
+                    && profile_monitor.name_hint == monitor.output_name,
+            }
         })
         .collect()
 }
@@ -464,8 +502,12 @@ pub fn profile_monitor_match_score(
     profile_monitor: &ProfileMonitor,
     current: &MonitorState,
 ) -> (i32, &'static str) {
-    if useful(&profile_monitor.id) && profile_monitor.id == current.id {
+    if trusted_exact_identity(profile_monitor, current) {
         return (EXACT_ID_SCORE, "exact monitor id");
+    }
+
+    if corroborated_legacy_identity(profile_monitor, current) {
+        return (CORROBORATED_LEGACY_ID_SCORE, "exact monitor id");
     }
 
     if same_make_model(profile_monitor, current)
@@ -494,6 +536,56 @@ pub fn profile_monitor_match_score(
     (0, "no match")
 }
 
+fn corroborated_legacy_identity(profile_monitor: &ProfileMonitor, current: &MonitorState) -> bool {
+    if profile_monitor.id != current.id
+        || infer_identity_provenance(
+            &profile_monitor.id,
+            &profile_monitor.make,
+            &profile_monitor.model,
+            &profile_monitor.serial,
+            &profile_monitor.description,
+        ) != IdentityProvenance::LegacyUntrusted
+    {
+        return false;
+    }
+    (same_make_model(profile_monitor, current)
+        && profile_monitor.serial == current.serial
+        && useful(&profile_monitor.make)
+        && useful(&profile_monitor.model))
+        || (useful(&profile_monitor.description)
+            && profile_monitor.description == current.description)
+}
+
+fn trusted_exact_identity(profile_monitor: &ProfileMonitor, current: &MonitorState) -> bool {
+    if !useful(&profile_monitor.id) || profile_monitor.id != current.id {
+        return false;
+    }
+    let stored_provenance = infer_identity_provenance(
+        &profile_monitor.id,
+        &profile_monitor.make,
+        &profile_monitor.model,
+        &profile_monitor.serial,
+        &profile_monitor.description,
+    );
+    if stored_provenance != current.identity_provenance() {
+        return false;
+    }
+    match stored_provenance {
+        IdentityProvenance::PhysicalSerial => {
+            profile_monitor.make == current.make
+                && profile_monitor.model == current.model
+                && profile_monitor.serial == current.serial
+        }
+        IdentityProvenance::PhysicalNoSerial => {
+            profile_monitor.make == current.make && profile_monitor.model == current.model
+        }
+        IdentityProvenance::Description => profile_monitor.description == current.description,
+        IdentityProvenance::ConnectorFallback
+        | IdentityProvenance::ConnectorDisambiguated
+        | IdentityProvenance::LegacyUntrusted => false,
+    }
+}
+
 fn same_make_model(profile_monitor: &ProfileMonitor, current: &MonitorState) -> bool {
     useful(&profile_monitor.make)
         && useful(&profile_monitor.model)
@@ -510,14 +602,18 @@ fn same_physical_size(profile_monitor: &ProfileMonitor, current: &MonitorState) 
 
 fn profile_monitor_label(profile_monitor: &ProfileMonitor) -> String {
     if useful(&profile_monitor.name_hint) {
-        return profile_monitor.name_hint.clone();
+        return safe_display(&profile_monitor.name_hint);
     }
 
-    profile_monitor.id.clone()
+    safe_display(&profile_monitor.id)
 }
 
 fn useful(value: &str) -> bool {
     !value.trim().is_empty() && slug_component(value) != "unknown"
+}
+
+fn safe_display(value: &str) -> String {
+    sanitize_terminal_text(value)
 }
 
 fn normalized_fallback_profile(fallback_profile: Option<&str>) -> Option<&str> {

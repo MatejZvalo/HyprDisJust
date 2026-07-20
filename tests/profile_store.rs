@@ -3,8 +3,14 @@ use std::fs;
 use hyprdisjust::config::ConfigPaths;
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
 use hyprdisjust::profile::store::ProfileStore;
+use hyprdisjust::profile::validation::{
+    validate_profile, MAX_COORDINATE, MAX_PROFILES, MAX_PROFILE_STORE_BYTES,
+};
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
+
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 const DESK: &str = include_str!("fixtures/hyprctl-monitors-desk.json");
 const INACTIVE: &str = include_str!("fixtures/hyprctl-monitors-inactive.json");
@@ -90,6 +96,103 @@ fn profile_store_roundtrips_as_toml() {
 }
 
 #[test]
+fn invalid_profile_semantics_are_rejected_during_load() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    fs::write(
+        &path,
+        r#"[[profiles]]
+name = "bad"
+created_at = "a"
+updated_at = "a"
+
+[[profiles.monitors]]
+id = "acme:panel:123"
+name_hint = "DP-1"
+description = "Panel"
+make = "Acme"
+model = "Panel"
+serial = "123"
+
+[[profiles.outputs]]
+monitor_id = "acme:panel:123"
+enabled = true
+mode = "not-a-mode"
+x = 0
+y = 0
+scale = 1.0
+transform = 0
+"#,
+    )
+    .unwrap();
+
+    let error = ProfileStore::load(path).unwrap_err();
+    assert!(format!("{error:#}").contains("invalid mode"));
+}
+
+#[test]
+fn oversized_profile_store_is_rejected_before_parsing() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    fs::write(&path, vec![b' '; 4 * 1024 * 1024 + 1]).unwrap();
+
+    let error = ProfileStore::load(path).unwrap_err();
+
+    assert!(format!("{error:#}").contains("too large"));
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_save_preserves_private_permissions_and_does_not_follow_symlinks() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    let victim = temp.path().join("victim");
+    fs::write(&victim, "do not overwrite").unwrap();
+    symlink(&victim, &path).unwrap();
+    let store = ProfileStore::default();
+
+    store.save_atomic(&path).unwrap();
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "do not overwrite");
+    assert!(!fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn locked_mutations_preserve_independent_concurrent_updates() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let first_path = path.clone();
+    let first_monitors = monitors.clone();
+    let first = std::thread::spawn(move || {
+        ProfileStore::mutate_atomic(first_path, |store| {
+            store.save_current_profile(Some("first"), &first_monitors, false)
+        })
+        .unwrap();
+    });
+    let second_path = path.clone();
+    let second = std::thread::spawn(move || {
+        ProfileStore::mutate_atomic(second_path, |store| {
+            store.save_current_profile(Some("second"), &monitors, false)
+        })
+        .unwrap();
+    });
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let store = ProfileStore::load(path).unwrap();
+    assert!(store.has_profile("first"));
+    assert!(store.has_profile("second"));
+}
+
+#[test]
 fn legacy_profile_monitors_default_missing_physical_dimensions() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("profiles.toml");
@@ -107,6 +210,15 @@ description = "Acme Panel"
 make = "Acme"
 model = "Panel"
 serial = "123"
+
+[[profiles.outputs]]
+monitor_id = "acme:panel:123"
+enabled = true
+mode = "1920x1080@60"
+x = 0
+y = 0
+scale = 1.0
+transform = 0
 "#,
     )
     .unwrap();
@@ -256,4 +368,75 @@ fn profile_store_lifecycle_refuses_ambiguous_mutations() {
     assert!(store.copy_profile("missing", "other", false).is_err());
     assert!(store.copy_profile("desk", "laptop", false).is_err());
     assert!(store.delete_profile("missing").is_err());
+}
+
+#[test]
+fn extreme_coordinates_are_rejected_without_panicking() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut profile = hyprdisjust::profile::store::Profile::from_monitors(
+        "desk".to_owned(),
+        &monitors,
+        "created".to_owned(),
+        "updated".to_owned(),
+    );
+
+    profile.outputs[0].x = i32::MIN;
+    assert!(validate_profile(&profile).is_err());
+    profile.outputs[0].x = i32::MAX;
+    assert!(validate_profile(&profile).is_err());
+    profile.outputs[0].x = -MAX_COORDINATE;
+    profile.outputs[0].y = MAX_COORDINATE;
+    validate_profile(&profile).unwrap();
+}
+
+#[test]
+fn save_rejects_serialized_store_above_load_limit() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    store.profiles[0].created_at = "x".repeat(MAX_PROFILE_STORE_BYTES as usize);
+
+    let error = store.save_atomic(path).unwrap_err();
+
+    assert!(format!("{error:#}").contains("larger than"));
+}
+
+#[test]
+fn structural_profile_limit_is_enforced_before_matching() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let profile = hyprdisjust::profile::store::Profile::from_monitors(
+        "desk".to_owned(),
+        &monitors,
+        "created".to_owned(),
+        "updated".to_owned(),
+    );
+    let store = ProfileStore {
+        profiles: vec![profile; MAX_PROFILES + 1],
+    };
+    let temp = tempdir().unwrap();
+
+    let error = store
+        .save_atomic(temp.path().join("profiles.toml"))
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("maximum"));
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_lock_symlink_is_rejected_without_touching_target() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("profiles.toml");
+    let victim = temp.path().join("victim");
+    fs::write(&victim, "unchanged").unwrap();
+    symlink(&victim, temp.path().join("profiles.lock")).unwrap();
+
+    let error = ProfileStore::mutate_atomic(path, |_| Ok(())).unwrap_err();
+
+    assert!(format!("{error:#}").contains("profile lock"));
+    assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
 }

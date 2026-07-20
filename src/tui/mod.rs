@@ -5,6 +5,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Context;
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -20,10 +21,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::hyprland::hyprctl::{current_monitors, live_monitors};
-use crate::profile::apply::{apply_plan_safely, ApplyOutcome, TerminalConfirmation};
+use crate::hyprland::hyprctl::current_monitors;
+use crate::profile::apply::{
+    execute_apply_transaction_if, ApplyOutcome, ApplyTransactionRequest, ApplyTransactionState,
+    TerminalConfirmation,
+};
 
-use self::geometry::{output_rect, CanvasTransform, SnapDirection};
+use self::geometry::{output_rect_with_monitors, CanvasTransform, SnapDirection};
 pub use self::model::{
     initial_model, require_draft_plan, TuiAction, TuiApp, TuiCurrentMonitorRow, TuiEffect,
     TuiInputMode, TuiModel, TuiMonitorRow, TuiProfileRow,
@@ -35,6 +39,31 @@ struct TuiLayout {
     canvas: Rect,
 }
 
+struct TerminalGuard {
+    armed: bool,
+}
+
+impl TerminalGuard {
+    fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
+        let _ = disable_raw_mode();
+    }
+}
+
 pub fn run(mut app: TuiApp) -> anyhow::Result<()> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
@@ -42,19 +71,18 @@ pub fn run(mut app: TuiApp) -> anyhow::Result<()> {
         let _ = disable_raw_mode();
         return Err(error).context("failed to enter alternate screen");
     }
+    let mut guard = TerminalGuard::armed();
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
-        Err(error) => {
-            let mut stdout = io::stdout();
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
-            let _ = disable_raw_mode();
-            return Err(error).context("failed to initialize terminal");
-        }
+        Err(error) => return Err(error).context("failed to initialize terminal"),
     };
     let run_result = run_loop(&mut terminal, &mut app);
     let restore_result = restore_terminal(&mut terminal);
+    if restore_result.is_ok() {
+        guard.disarm();
+    }
 
     run_result?;
     restore_result
@@ -64,12 +92,17 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut TuiApp,
 ) -> anyhow::Result<()> {
-    let mut drag_last: Option<(u16, u16)> = None;
+    let mut drag_last: Option<(usize, u16, u16)> = None;
+    let mut needs_redraw = true;
 
     loop {
-        terminal
-            .draw(|frame| render(frame, &app.view_model()))
-            .context("failed to draw terminal UI")?;
+        if needs_redraw {
+            let view_model = app.view_model();
+            terminal
+                .draw(|frame| render(frame, &view_model))
+                .context("failed to draw terminal UI")?;
+            needs_redraw = false;
+        }
 
         if !event::poll(Duration::from_millis(100)).context("failed to poll terminal events")? {
             continue;
@@ -80,6 +113,7 @@ fn run_loop(
                 let Some(action) = key_to_action(key, &app.input_mode) else {
                     continue;
                 };
+                needs_redraw = true;
                 match handle_effect(app, action) {
                     Ok(true) => return Ok(()),
                     Ok(false) => {}
@@ -87,6 +121,7 @@ fn run_loop(
                 }
             }
             Event::Mouse(mouse) => {
+                needs_redraw = true;
                 let area = terminal.size().context("failed to read terminal size")?;
                 let layout = layout_areas(area.into());
                 match handle_mouse(app, mouse, layout, &mut drag_last) {
@@ -95,6 +130,7 @@ fn run_loop(
                     Err(error) => app.mark_action_failed(&error),
                 }
             }
+            Event::Resize(_, _) => needs_redraw = true,
             _ => {}
         }
     }
@@ -104,24 +140,42 @@ fn handle_effect(app: &mut TuiApp, action: TuiAction) -> anyhow::Result<bool> {
     match app.handle_action(action)? {
         TuiEffect::None => Ok(false),
         TuiEffect::Quit => Ok(true),
-        TuiEffect::Apply(_) => {
-            let monitors = live_monitors()
-                .context("failed to refresh monitors immediately before TUI apply")?;
-            let plan = app.draft_apply_plan_for_monitors(monitors)?;
-            if plan.is_noop {
-                app.mark_noop();
-                return Ok(false);
-            }
+        TuiEffect::Apply(approved_plan) => {
             let mut confirmation = TerminalConfirmation;
-            match apply_plan_safely(&plan, Some(&mut confirmation)) {
-                Ok(ApplyOutcome::Confirmed) => app.mark_applied(),
-                Ok(ApplyOutcome::RolledBack { reason }) => app.mark_apply_failed(&anyhow::anyhow!(
-                    "profile was not confirmed ({reason}); previous layout restored"
-                )),
-                Ok(ApplyOutcome::Noop) => app.mark_noop(),
-                Ok(ApplyOutcome::Unattended) => app.mark_apply_failed(&anyhow::anyhow!(
-                    "TUI apply completed without the required confirmation"
-                )),
+            let result = execute_apply_transaction_if(
+                app.paths.profile_store_path(),
+                ApplyTransactionRequest::Draft(app.draft.clone()),
+                Some(&mut confirmation),
+                |authoritative, _, _| {
+                    if authoritative.profile_name != approved_plan.profile_name
+                        || authoritative.mappings != approved_plan.mappings
+                        || authoritative.batch != approved_plan.batch
+                        || authoritative.warnings != approved_plan.warnings
+                    {
+                        anyhow::bail!(
+                            "monitor topology changed after plan review; refresh and review the new apply plan"
+                        );
+                    }
+                    Ok(true)
+                },
+            );
+            match result {
+                Ok(ApplyTransactionState::Completed(result)) => match &result.outcome {
+                    ApplyOutcome::Confirmed => app.mark_applied(result.final_state.clone()),
+                    ApplyOutcome::RolledBack { reason } => {
+                        app.mark_rolled_back(result.final_state.clone(), reason)
+                    }
+                    ApplyOutcome::Noop => {
+                        app.update_monitors(result.final_state.clone());
+                        app.mark_noop();
+                    }
+                    ApplyOutcome::Unattended => app.mark_apply_failed(&anyhow::anyhow!(
+                        "TUI apply completed without the required confirmation"
+                    )),
+                },
+                Ok(ApplyTransactionState::NoAutomaticMatch { .. }) => app.mark_apply_failed(
+                    &anyhow::anyhow!("draft apply unexpectedly used automatic selection"),
+                ),
                 Err(error) => app.mark_apply_failed(&error),
             }
             Ok(false)
@@ -140,11 +194,11 @@ fn handle_mouse(
     app: &mut TuiApp,
     mouse: MouseEvent,
     layout: TuiLayout,
-    drag_last: &mut Option<(u16, u16)>,
+    drag_last: &mut Option<(usize, u16, u16)>,
 ) -> anyhow::Result<bool> {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            *drag_last = Some((mouse.column, mouse.row));
+            *drag_last = None;
             if contains(layout.profile_list, mouse.column, mouse.row) {
                 if let Some(index) = list_index_at(layout.profile_list, mouse.row) {
                     return handle_effect(app, TuiAction::SelectProfile(index));
@@ -152,22 +206,33 @@ fn handle_mouse(
             }
 
             if contains(layout.canvas, mouse.column, mouse.row) {
-                let transform = CanvasTransform::new(&app.draft.outputs, inner(layout.canvas));
-                if let Some(index) =
-                    transform.output_at(&app.draft.outputs, mouse.column, mouse.row)
-                {
+                let transform = CanvasTransform::new_with_monitors(
+                    &app.draft.outputs,
+                    &app.monitors,
+                    inner(layout.canvas),
+                );
+                if let Some(index) = transform.output_at_with_monitors(
+                    &app.draft.outputs,
+                    &app.monitors,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    *drag_last = Some((index, mouse.column, mouse.row));
                     return handle_effect(app, TuiAction::SelectMonitor(index));
                 }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            let Some((last_column, last_row)) = *drag_last else {
-                *drag_last = Some((mouse.column, mouse.row));
+            let Some((index, last_column, last_row)) = *drag_last else {
                 return Ok(false);
             };
-            *drag_last = Some((mouse.column, mouse.row));
+            *drag_last = Some((index, mouse.column, mouse.row));
             if contains(layout.canvas, mouse.column, mouse.row) {
-                let transform = CanvasTransform::new(&app.draft.outputs, inner(layout.canvas));
+                let transform = CanvasTransform::new_with_monitors(
+                    &app.draft.outputs,
+                    &app.monitors,
+                    inner(layout.canvas),
+                );
                 let dx = i32::from(mouse.column) - i32::from(last_column);
                 let dy = i32::from(mouse.row) - i32::from(last_row);
                 let (logical_dx, logical_dy) = transform.cell_delta_to_logical(dx, dy);
@@ -375,10 +440,12 @@ fn render_canvas(frame: &mut Frame<'_>, model: &TuiModel, area: Rect) {
     frame.render_widget(block, area);
 
     let outputs: Vec<_> = model.monitors.iter().map(profile_output_from_row).collect();
-    let transform = CanvasTransform::new(&outputs, inner_area);
+    let transform =
+        CanvasTransform::new_with_monitors(&outputs, &model.current_monitor_states, inner_area);
 
     for (index, output) in outputs.iter().enumerate() {
-        let Some(logical_rect) = output_rect(output) else {
+        let Some(logical_rect) = output_rect_with_monitors(output, &model.current_monitor_states)
+        else {
             continue;
         };
         let cell_rect = transform.to_cell_rect(logical_rect);

@@ -11,6 +11,100 @@ use pretty_assertions::assert_eq;
 
 const DESK: &str = include_str!("fixtures/hyprctl-monitors-desk.json");
 const DOCK_RENAMED: &str = include_str!("fixtures/hyprctl-monitors-dock-renamed.json");
+const DUPLICATE_NO_SERIAL: &str = r#"[
+  {
+    "id": 0,
+    "name": "DP-1",
+    "description": "Acme SamePanel",
+    "make": "Acme",
+    "model": "SamePanel",
+    "serial": "",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0
+  },
+  {
+    "id": 1,
+    "name": "DP-2",
+    "description": "Acme SamePanel",
+    "make": "Acme",
+    "model": "SamePanel",
+    "serial": "",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 1920,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0
+  }
+]"#;
+const DUPLICATE_NO_SERIAL_RENAMED: &str = r#"[
+  {
+    "id": 0,
+    "name": "HDMI-A-1",
+    "description": "Acme SamePanel",
+    "make": "Acme",
+    "model": "SamePanel",
+    "serial": "",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 0,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0
+  },
+  {
+    "id": 1,
+    "name": "HDMI-A-2",
+    "description": "Acme SamePanel",
+    "make": "Acme",
+    "model": "SamePanel",
+    "serial": "",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 1920,
+    "y": 0,
+    "scale": 1.0,
+    "transform": 0
+  }
+]"#;
+
+#[test]
+fn explicit_apply_and_rollback_use_same_connector_for_duplicate_monitors() {
+    let current = parse_monitors_output(DUPLICATE_NO_SERIAL).unwrap();
+    let profile = profile_from_monitors("twins", &current);
+
+    let rendered = render_monitor_rules(&profile, &current).unwrap();
+    assert_eq!(
+        rendered
+            .mappings
+            .iter()
+            .map(|mapping| mapping.output_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["DP-1", "DP-2"]
+    );
+
+    assert!(plan_apply(&profile, &current).is_ok());
+}
+
+#[test]
+fn renamed_connectors_remain_ambiguous_for_duplicate_monitors() {
+    let saved = parse_monitors_output(DUPLICATE_NO_SERIAL).unwrap();
+    let current = parse_monitors_output(DUPLICATE_NO_SERIAL_RENAMED).unwrap();
+    let profile = profile_from_monitors("twins", &saved);
+
+    let error = render_monitor_rules(&profile, &current).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("maps to multiple current outputs"));
+}
 
 #[test]
 fn renders_exact_monitor_rules_from_saved_profile() {

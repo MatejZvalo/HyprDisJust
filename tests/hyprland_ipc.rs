@@ -1,7 +1,10 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::io::Write;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use hyprdisjust::daemon::{
@@ -10,9 +13,80 @@ use hyprdisjust::daemon::{
 };
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
 use hyprdisjust::hyprland::ipc::{
-    discover_socket2_path_with, parse_monitor_event, resolve_socket2_path_with, socket2_path,
-    MonitorSocketEvent,
+    discover_socket2_path, discover_socket2_path_with, parse_monitor_event,
+    resolve_socket2_path_with, socket2_path, MonitorSocketEvent, Socket2EventReader,
 };
+
+#[test]
+fn fragmented_socket_frame_survives_a_read_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("socket2");
+    let listener = UnixListener::bind(&path).unwrap();
+    let writer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"monitoraddedv2>>1,DP").unwrap();
+        thread::sleep(Duration::from_millis(75));
+        stream.write_all(b"-1,Panel\n").unwrap();
+    });
+    let mut reader = Socket2EventReader::connect(path).unwrap();
+
+    assert_eq!(
+        reader
+            .read_monitor_event_timeout(Duration::from_millis(20))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reader
+            .read_monitor_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        Some(MonitorSocketEvent::AddedV2)
+    );
+    writer.join().unwrap();
+}
+
+#[test]
+fn oversized_socket_frame_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("socket2");
+    let listener = UnixListener::bind(&path).unwrap();
+    let writer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(&vec![b'x'; 70 * 1024]).unwrap();
+    });
+    let mut reader = Socket2EventReader::connect(path).unwrap();
+
+    let error = reader.read_monitor_event().unwrap_err();
+    assert!(format!("{error:#}").contains("exceeded 65536 bytes"));
+    writer.join().unwrap();
+}
+
+#[test]
+fn live_socket_discovery_ignores_a_stale_socket_inode() {
+    let temp = tempfile::tempdir().unwrap();
+    let hypr = temp.path().join("hypr");
+    std::fs::create_dir(&hypr).unwrap();
+    let stale_dir = hypr.join("stale");
+    let live_dir = hypr.join("live");
+    std::fs::create_dir(&stale_dir).unwrap();
+    std::fs::create_dir(&live_dir).unwrap();
+    let stale = stale_dir.join(".socket2.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    let live = live_dir.join(".socket2.sock");
+    let _listener = UnixListener::bind(&live).unwrap();
+
+    assert_eq!(discover_socket2_path(temp.path()).unwrap(), live);
+}
+
+#[test]
+fn unsafe_instance_signatures_are_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    for signature in ["../other", "/absolute", ".", "a/b"] {
+        let error =
+            resolve_socket2_path_with(temp.path(), Some(signature.as_ref()), |_| true).unwrap_err();
+        assert!(format!("{error:#}").contains("exactly one normal path component"));
+    }
+}
 
 #[test]
 fn parses_socket2_monitor_events() {

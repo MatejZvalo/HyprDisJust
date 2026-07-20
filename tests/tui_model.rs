@@ -1,13 +1,17 @@
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
 use hyprdisjust::profile::store::{ProfileOutput, ProfileStore};
 use hyprdisjust::tui::geometry::{
-    move_output, output_rect, snap_output, CanvasTransform, SnapDirection,
-    TERMINAL_CELL_ASPECT_RATIO,
+    move_output, output_rect, output_rect_with_monitors, snap_output, CanvasTransform,
+    SnapDirection, TERMINAL_CELL_ASPECT_RATIO,
 };
 use hyprdisjust::tui::{
     format_snapshot, initial_model, render, TuiAction, TuiApp, TuiEffect, TuiInputMode,
 };
-use hyprdisjust::{config::AppConfig, config::ConfigPaths};
+use hyprdisjust::{
+    config::AppConfig,
+    config::ConfigPaths,
+    profile::validation::{MAX_PROFILE_NAME_BYTES, MAX_SCALE, MIN_SCALE},
+};
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -333,6 +337,55 @@ fn save_as_existing_profile_requires_replace_confirmation() {
 }
 
 #[test]
+fn profile_name_editing_is_bounded_by_utf8_byte_length() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), ProfileStore::default(), monitors);
+    app.input_mode = TuiInputMode::SaveAs {
+        name: String::new(),
+    };
+
+    for _ in 0..MAX_PROFILE_NAME_BYTES {
+        app.handle_action(TuiAction::SaveNameChar('a')).unwrap();
+    }
+    app.handle_action(TuiAction::SaveNameChar('é')).unwrap();
+
+    assert!(matches!(
+        app.input_mode,
+        TuiInputMode::SaveAs { ref name } if name.len() == MAX_PROFILE_NAME_BYTES
+    ));
+}
+
+#[test]
+fn tui_scale_editor_uses_shared_validation_range() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), ProfileStore::default(), monitors);
+
+    app.draft.outputs[0].scale = MIN_SCALE;
+    app.handle_action(TuiAction::AdjustSelectedScale(-1.0))
+        .unwrap();
+    assert_eq!(app.draft.outputs[0].scale, MIN_SCALE);
+
+    app.draft.outputs[0].scale = MAX_SCALE;
+    app.handle_action(TuiAction::AdjustSelectedScale(1.0))
+        .unwrap();
+    assert_eq!(app.draft.outputs[0].scale, MAX_SCALE);
+}
+
+#[test]
+fn moving_a_disabled_output_does_not_mark_the_draft_dirty() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), ProfileStore::default(), monitors);
+    app.draft.outputs[0].enabled = false;
+
+    app.handle_action(TuiAction::MoveSelected(20, 20)).unwrap();
+
+    assert!(!app.dirty);
+}
+
+#[test]
 fn tui_can_rename_and_delete_saved_profiles() {
     let monitors = parse_monitors_output(DESK).unwrap();
     let mut store = ProfileStore::default();
@@ -587,6 +640,53 @@ fn geometry_ignores_disabled_snap_targets() {
     outputs[1].enabled = false;
 
     assert!(!snap_output(&mut outputs, 0, 1, SnapDirection::Right));
+}
+
+#[test]
+fn geometry_resolves_supported_special_modes_from_current_monitor() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    for mode in ["preferred", "highres", "highrr", "maxwidth"] {
+        let output = output(&monitors[0].id, 0, 0, mode, 1.0, 0);
+        let rect = output_rect_with_monitors(&output, &monitors).unwrap();
+        assert!(rect.width > 0);
+        assert!(rect.height > 0);
+    }
+}
+
+#[test]
+fn canvas_bounds_include_large_positive_gaps() {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 40,
+    };
+    let outputs = vec![
+        output("left", 0, 0, "1920x1080@60", 1.0, 0),
+        output("far", 12_000, 0, "1920x1080@60", 1.0, 0),
+    ];
+    let transform = CanvasTransform::new(&outputs, area);
+    let left = transform.to_cell_rect(output_rect(&outputs[0]).unwrap());
+    let far = transform.to_cell_rect(output_rect(&outputs[1]).unwrap());
+
+    assert!(far.x > left.right());
+}
+
+#[test]
+fn successful_apply_updates_current_monitor_snapshot() {
+    let monitors = parse_monitors_output(DESK).unwrap();
+    let mut store = ProfileStore::default();
+    store
+        .save_current_profile(Some("desk"), &monitors, false)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_for(temp.path(), store, monitors.clone());
+    let mut updated = monitors;
+    updated[0].x += 20;
+
+    app.mark_applied(updated.clone());
+
+    assert_eq!(app.monitors, updated);
 }
 
 fn app_for(

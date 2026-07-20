@@ -1,13 +1,18 @@
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use directories::BaseDirs;
 
+use crate::atomic::{atomic_write, PUBLIC_FILE_MODE};
+use crate::process::{output_details, run_bounded};
+
 const SERVICE_NAME: &str = "hyprdisjust.service";
 const SYSTEMD_USER_DIR_ENV: &str = "HYPRDISJUST_SYSTEMD_USER_DIR";
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
+const SYSTEMCTL_OUTPUT_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemdInstallOptions {
@@ -32,18 +37,18 @@ pub fn install_user_service(
     let service_dir = systemd_user_dir()?;
     let service_path = service_dir.join(SERVICE_NAME);
     let exe = env::current_exe().context("failed to determine current executable path")?;
-    let service_contents = render_user_service(&exe, options.unattended);
+    let service_contents = render_user_service(&exe, options.unattended)?;
+    verify_service_contents(&service_contents)?;
 
     if !options.dry_run {
-        fs::create_dir_all(&service_dir).with_context(|| {
-            format!(
-                "failed to create systemd user service directory {}",
-                service_dir.display()
-            )
-        })?;
-        fs::write(&service_path, &service_contents).with_context(|| {
-            format!("failed to write systemd service {}", service_path.display())
-        })?;
+        atomic_write(&service_path, service_contents.as_bytes(), PUBLIC_FILE_MODE).with_context(
+            || {
+                format!(
+                    "failed to install systemd service {}",
+                    service_path.display()
+                )
+            },
+        )?;
         run_systemctl(&["daemon-reload"])?;
     }
 
@@ -63,13 +68,13 @@ pub fn install_user_service(
     })
 }
 
-pub fn render_user_service(exe: &Path, unattended: bool) -> String {
+pub fn render_user_service(exe: &Path, unattended: bool) -> anyhow::Result<String> {
     let unattended_arg = if unattended { " --unattended" } else { "" };
-    format!(
+    Ok(format!(
         "[Unit]\nDescription=HyprDisJust monitor profile daemon\nAfter=graphical-session.target\n\n[Service]\nExecStart={} daemon{}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
-        quote_systemd_arg(exe),
+        quote_systemd_arg(exe)?,
         unattended_arg
-    )
+    ))
 }
 
 pub fn user_service_path() -> anyhow::Result<PathBuf> {
@@ -90,29 +95,60 @@ fn systemd_user_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn run_systemctl(args: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to run `systemctl --user {}`", args.join(" ")))?;
-    if !status.success() {
+    let mut command = Command::new("systemctl");
+    command.arg("--user").args(args);
+    let operation = format!("systemctl --user {}", args.join(" "));
+    let output = run_bounded(
+        &mut command,
+        &operation,
+        SYSTEMCTL_TIMEOUT,
+        SYSTEMCTL_OUTPUT_LIMIT,
+    )?;
+    if !output.status.success() {
+        let details = output_details(&output);
         anyhow::bail!(
-            "`systemctl --user {}` failed with status {}",
-            args.join(" "),
-            status
+            "`{operation}` failed with status {}{}{}",
+            output.status,
+            if details.is_empty() { "" } else { ": " },
+            details
         );
     }
     Ok(())
 }
 
-fn quote_systemd_arg(path: &Path) -> String {
-    let value = path.to_string_lossy();
+fn quote_systemd_arg(path: &Path) -> anyhow::Result<String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| anyhow!("systemd executable path must be valid UTF-8"))?;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("systemd executable path must not contain control characters");
+    }
+    if value.contains(['%', '$', '"', '\\']) {
+        anyhow::bail!(
+            "systemd executable path contains unsupported `%`, `$`, quote, or backslash characters"
+        );
+    }
     if value
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || "/._+-".contains(character))
     {
-        return value.into_owned();
+        return Ok(value.to_owned());
     }
 
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    Ok(format!("\"{value}\""))
+}
+
+fn verify_service_contents(contents: &str) -> anyhow::Result<()> {
+    if contents
+        .chars()
+        .any(|character| character == '\0' || character == '\r')
+    {
+        anyhow::bail!("generated systemd unit contains unsupported control characters");
+    }
+    for required in ["[Unit]", "[Service]", "ExecStart=", "[Install]"] {
+        if !contents.lines().any(|line| line.starts_with(required)) {
+            anyhow::bail!("generated systemd unit is missing `{required}`");
+        }
+    }
+    Ok(())
 }

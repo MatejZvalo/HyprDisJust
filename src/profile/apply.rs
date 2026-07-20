@@ -1,24 +1,35 @@
 use std::collections::HashSet;
+use std::env;
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
 
+use crate::atomic::{ensure_private_directory, open_private_lock};
+use crate::config::ConfigPaths;
 use crate::hyprland::hyprctl::HyprctlClient;
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::render::{render_hyprctl_batch, render_monitor_rules, RuleMapping};
-use crate::profile::store::{Profile, ProfileOutput};
+use crate::profile::r#match::{
+    best_profile_match, decide_auto_apply, AutoApplyDecision, MonitorMatchMode,
+};
+use crate::profile::render::{
+    render_hyprctl_batch, render_monitor_rules, render_monitor_rules_automatic,
+    render_monitor_rules_with_mode, RuleMapping,
+};
+use crate::profile::store::{Profile, ProfileOutput, ProfileStore};
+use crate::profile::validation::{parse_mode, validate_profile};
+use crate::text::{sanitize_terminal_text, write_stdout, write_stdout_line};
 
 const REFRESH_TOLERANCE_HZ: f64 = 0.2;
 const SCALE_TOLERANCE: f64 = 0.001;
 const LOGICAL_SIZE_TOLERANCE: f64 = 0.01;
-const MIN_SCALE: f64 = 0.1;
-const MAX_SCALE: f64 = 10.0;
 pub const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15);
-const VERIFY_ATTEMPTS: usize = 3;
-const VERIFY_RETRY_DELAY: Duration = Duration::from_millis(75);
+const VERIFY_ATTEMPTS: usize = 9;
+const VERIFY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const VERIFY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplyPlan {
@@ -32,6 +43,7 @@ pub struct ApplyPlan {
     expected: Vec<ExpectedMonitorState>,
     rollback_batch: String,
     rollback_expected: Vec<ExpectedMonitorState>,
+    match_mode: MonitorMatchMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +73,39 @@ pub enum ApplyOutcome {
     RolledBack { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApplyTransactionRequest {
+    Named(String),
+    Automatic { fallback_profile: Option<String> },
+    Draft(Profile),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyTransactionResult {
+    pub outcome: ApplyOutcome,
+    pub execution: ApplyExecution,
+    pub plan: ApplyPlan,
+    pub snapshot: Vec<MonitorState>,
+    pub final_state: Vec<MonitorState>,
+    pub automatic_decision: Option<AutoApplyDecision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyExecution {
+    Suppressed,
+    Noop,
+    Applied,
+    RolledBack,
+}
+
+pub(crate) enum ApplyTransactionState {
+    Completed(Box<ApplyTransactionResult>),
+    NoAutomaticMatch {
+        decision: AutoApplyDecision,
+        snapshot: Vec<MonitorState>,
+    },
+}
+
 pub trait ApplyConfirmation {
     /// Check confirmation input before the monitor layout is changed.
     fn prepare(&mut self) -> anyhow::Result<()>;
@@ -74,6 +119,9 @@ pub trait ApplyConfirmation {
 
 pub trait MonitorController {
     fn apply_monitor_batch(&mut self, batch: &str) -> anyhow::Result<()>;
+    fn rollback_monitor_batch(&mut self, batch: &str) -> anyhow::Result<()> {
+        self.apply_monitor_batch(batch)
+    }
     fn monitors_all(&mut self) -> anyhow::Result<Vec<MonitorState>>;
 }
 
@@ -147,9 +195,9 @@ fn read_terminal_confirmation(
             .as_secs()
             .saturating_add(u64::from(remaining.subsec_nanos() > 0));
         if last_displayed != Some(seconds) {
-            print!(
+            write_stdout(&format!(
                 "\rKeep profile `{profile_name}`? Press `y` to confirm ({seconds:>2}s remaining): "
-            );
+            ))?;
             io::stdout()
                 .flush()
                 .context("failed to show confirmation countdown")?;
@@ -176,15 +224,16 @@ fn read_terminal_confirmation(
 }
 
 fn finish_confirmation_line() -> anyhow::Result<()> {
-    println!();
-    io::stdout()
-        .flush()
-        .context("failed to finish confirmation countdown")
+    write_stdout_line("").context("failed to finish confirmation countdown")
 }
 
 impl MonitorController for HyprctlClient {
     fn apply_monitor_batch(&mut self, batch: &str) -> anyhow::Result<()> {
         HyprctlClient::apply_monitor_batch(self, batch)
+    }
+
+    fn rollback_monitor_batch(&mut self, batch: &str) -> anyhow::Result<()> {
+        HyprctlClient::rollback_monitor_batch(self, batch)
     }
 
     fn monitors_all(&mut self) -> anyhow::Result<Vec<MonitorState>> {
@@ -195,6 +244,7 @@ impl MonitorController for HyprctlClient {
 #[derive(Debug, Clone, PartialEq)]
 struct ExpectedMonitorState {
     output_name: String,
+    monitor_id: String,
     enabled: bool,
     mode: String,
     x: i32,
@@ -222,11 +272,29 @@ impl ApplyWarning {
 }
 
 pub fn plan_apply(profile: &Profile, current: &[MonitorState]) -> anyhow::Result<ApplyPlan> {
-    validate_profile_outputs(profile)?;
-    let rendered = render_monitor_rules(profile, current)?;
+    plan_apply_with_mode(profile, current, MonitorMatchMode::Explicit)
+}
+
+pub fn plan_apply_automatic(
+    profile: &Profile,
+    current: &[MonitorState],
+) -> anyhow::Result<ApplyPlan> {
+    plan_apply_with_mode(profile, current, MonitorMatchMode::Automatic)
+}
+
+fn plan_apply_with_mode(
+    profile: &Profile,
+    current: &[MonitorState],
+    match_mode: MonitorMatchMode,
+) -> anyhow::Result<ApplyPlan> {
+    validate_profile(profile)?;
+    let rendered = match match_mode {
+        MonitorMatchMode::Automatic => render_monitor_rules_automatic(profile, current)?,
+        MonitorMatchMode::Explicit => render_monitor_rules(profile, current)?,
+    };
     validate_mapped_output_scales(profile, current, &rendered.mappings)?;
-    let warnings = apply_warnings(profile);
-    let expected = expected_monitor_states(profile, &rendered.mappings, false);
+    let warnings = apply_warnings(profile, current, &rendered.mappings);
+    let expected = expected_monitor_states(profile, current, &rendered.mappings, false);
     let (rollback_batch, rollback_expected) = render_rollback_snapshot(current)?;
     let is_noop = verify_expected_state(&expected, current).is_ok();
 
@@ -241,6 +309,7 @@ pub fn plan_apply(profile: &Profile, current: &[MonitorState]) -> anyhow::Result
         expected,
         rollback_batch,
         rollback_expected,
+        match_mode,
     })
 }
 
@@ -248,18 +317,267 @@ pub fn apply_plan_safely(
     plan: &ApplyPlan,
     confirmation: Option<&mut dyn ApplyConfirmation>,
 ) -> anyhow::Result<ApplyOutcome> {
+    let paths = ConfigPaths::resolve()?;
+    execute_apply_transaction(
+        paths.profile_store_path(),
+        ApplyTransactionRequest::Draft(plan.profile.clone()),
+        confirmation,
+    )
+    .map(|result| result.outcome)
+}
+
+pub fn execute_apply_transaction(
+    profile_store_path: &Path,
+    request: ApplyTransactionRequest,
+    confirmation: Option<&mut dyn ApplyConfirmation>,
+) -> anyhow::Result<ApplyTransactionResult> {
+    match execute_apply_transaction_if(profile_store_path, request, confirmation, |_, _, _| {
+        Ok(true)
+    })? {
+        ApplyTransactionState::Completed(result) => Ok(*result),
+        ApplyTransactionState::NoAutomaticMatch { decision, .. } => {
+            Err(auto_decision_error(&decision))
+        }
+    }
+}
+
+pub(crate) fn execute_apply_transaction_if(
+    profile_store_path: &Path,
+    request: ApplyTransactionRequest,
+    confirmation: Option<&mut dyn ApplyConfirmation>,
+    before_apply: impl FnOnce(
+        &ApplyPlan,
+        &[MonitorState],
+        Option<&AutoApplyDecision>,
+    ) -> anyhow::Result<bool>,
+) -> anyhow::Result<ApplyTransactionState> {
+    let _lock = acquire_apply_lock(profile_store_path)?;
     let mut client = HyprctlClient;
     let mut wait = SystemApplyWait;
-    let current = client
+    let snapshot = client
         .monitors_all()
-        .context("failed to query live monitor topology immediately before apply")?;
-    let refreshed_plan = replan_apply(plan, &current)
-        .context("failed to rebuild the apply plan from the immediate monitor topology")?;
-    apply_plan_safely_with_controller(&refreshed_plan, &mut client, &mut wait, confirmation, false)
+        .context("failed to query authoritative monitor topology inside apply transaction")?;
+    let (profile, automatic_decision) = match request {
+        ApplyTransactionRequest::Draft(profile) => (profile, None),
+        ApplyTransactionRequest::Named(name) => {
+            let store = ProfileStore::load(profile_store_path)?;
+            let profile = store
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("profile `{name}` does not exist"))?;
+            (profile, None)
+        }
+        ApplyTransactionRequest::Automatic { fallback_profile } => {
+            let store = ProfileStore::load(profile_store_path)?;
+            let best = best_profile_match(&store, &snapshot);
+            let decision = decide_auto_apply(&store, &best, fallback_profile.as_deref());
+            let profile_name = match &decision {
+                AutoApplyDecision::Apply { profile_name, .. } => profile_name,
+                _ => {
+                    return Ok(ApplyTransactionState::NoAutomaticMatch { decision, snapshot });
+                }
+            };
+            let profile = store
+                .profiles
+                .iter()
+                .find(|profile| profile.name == *profile_name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("selected profile `{profile_name}` disappeared"))?;
+            (profile, Some(decision))
+        }
+    };
+    let plan = match automatic_decision.is_some() {
+        true => plan_apply_automatic(&profile, &snapshot),
+        false => plan_apply(&profile, &snapshot),
+    }
+    .context("failed to build apply plan from authoritative monitor topology")?;
+    if !before_apply(&plan, &snapshot, automatic_decision.as_ref())? {
+        return Ok(ApplyTransactionState::Completed(Box::new(
+            ApplyTransactionResult {
+                outcome: ApplyOutcome::Noop,
+                execution: ApplyExecution::Suppressed,
+                plan,
+                final_state: snapshot.clone(),
+                snapshot,
+                automatic_decision,
+            },
+        )));
+    }
+    let mut outcome =
+        apply_plan_safely_with_controller(&plan, &mut client, &mut wait, confirmation).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "{error:#}\nPrevious layout:\n(authoritative transaction snapshot)\n{}",
+                    format_snapshot(&snapshot)
+                )
+            },
+        )?;
+    let mut final_state = if outcome == ApplyOutcome::Noop {
+        snapshot.clone()
+    } else {
+        client
+            .monitors_all()
+            .context("failed to query final monitor state after apply transaction")?
+    };
+    let expected_final = match &outcome {
+        ApplyOutcome::Confirmed | ApplyOutcome::Unattended => Some(&plan.expected),
+        ApplyOutcome::RolledBack { .. } => Some(&plan.rollback_expected),
+        ApplyOutcome::Noop => None,
+    };
+    if let Some(expected) = expected_final {
+        if let Err(error) = verify_expected_state(expected, &final_state) {
+            let reason = format!("monitor state drifted before transaction completion: {error:#}");
+            if matches!(outcome, ApplyOutcome::Confirmed | ApplyOutcome::Unattended) {
+                rollback_after_unconfirmed(&mut client, &mut wait, &plan, &reason)?;
+                final_state = client
+                    .monitors_all()
+                    .context("failed to query monitor state after final-drift rollback")?;
+                verify_expected_state(&plan.rollback_expected, &final_state)
+                    .context("final-drift rollback state was not preserved")?;
+                outcome = ApplyOutcome::RolledBack { reason };
+            } else {
+                bail!("{reason}");
+            }
+        }
+    }
+    let execution = match &outcome {
+        ApplyOutcome::Noop => ApplyExecution::Noop,
+        ApplyOutcome::Confirmed | ApplyOutcome::Unattended => ApplyExecution::Applied,
+        ApplyOutcome::RolledBack { .. } => ApplyExecution::RolledBack,
+    };
+    Ok(ApplyTransactionState::Completed(Box::new(
+        ApplyTransactionResult {
+            outcome,
+            execution,
+            plan,
+            snapshot,
+            final_state,
+            automatic_decision,
+        },
+    )))
+}
+
+fn auto_decision_error(decision: &AutoApplyDecision) -> anyhow::Error {
+    match decision {
+        AutoApplyDecision::Apply { profile_name, .. } => {
+            anyhow::anyhow!("selected profile `{profile_name}` disappeared")
+        }
+        AutoApplyDecision::NoProfiles => anyhow::anyhow!("no profiles saved"),
+        AutoApplyDecision::Ambiguous { reason } => {
+            anyhow::anyhow!("automatic apply is ambiguous: {reason}")
+        }
+        AutoApplyDecision::MissingFallback { profile_name } => {
+            anyhow::anyhow!("fallback_profile `{profile_name}` does not exist")
+        }
+        AutoApplyDecision::NotEligible { reason } => {
+            anyhow::anyhow!("no exact or high-confidence profile match: {reason}")
+        }
+        AutoApplyDecision::NoMatch => anyhow::anyhow!("no useful profile match"),
+    }
+}
+
+fn acquire_apply_lock(profile_store_path: &Path) -> anyhow::Result<std::fs::File> {
+    let _ = profile_store_path;
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR is not set; cannot create apply lock"))?;
+    if runtime_dir.is_empty() {
+        bail!("XDG_RUNTIME_DIR is empty; cannot create apply lock");
+    }
+    let lock_path = apply_lock_path_for_runtime_dir(profile_store_path, Path::new(&runtime_dir))?;
+    let file = open_private_lock(&lock_path, "apply lock")?;
+    file.lock()
+        .with_context(|| format!("failed to lock apply transaction {}", lock_path.display()))?;
+    Ok(file)
+}
+
+fn apply_lock_path_for_runtime_dir(
+    _profile_store_path: &Path,
+    runtime_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    ensure_private_directory(runtime_dir)?;
+    let lock_dir = runtime_dir.join("hyprdisjust");
+    match ensure_private_directory(&lock_dir) {
+        Ok(()) => Ok(lock_dir.join("apply.lock")),
+        Err(error) if runtime_path_is_unavailable(&error) => {
+            let fallback_dir = env::temp_dir().join(format!("hyprdisjust-{}", current_user_tag()));
+            ensure_private_directory(&fallback_dir)?;
+            Ok(fallback_dir.join("apply.lock"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn runtime_path_is_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        })
+    })
+}
+
+fn current_user_tag() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and does not dereference pointers.
+        unsafe { libc::geteuid() }.to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        "current-user".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_lock_path_is_independent_of_profile_store_root() {
+        let runtime = tempfile::tempdir().unwrap();
+        let first =
+            apply_lock_path_for_runtime_dir(Path::new("/one/config/profiles.toml"), runtime.path())
+                .unwrap();
+        let second =
+            apply_lock_path_for_runtime_dir(Path::new("/two/config/profiles.toml"), runtime.path())
+                .unwrap();
+
+        assert_eq!(first, second);
+    }
+}
+
+fn format_snapshot(monitors: &[MonitorState]) -> String {
+    monitors
+        .iter()
+        .map(|monitor| {
+            format!(
+                "{} id={} enabled={} mode={}x{}@{} position={}x{} scale={} transform={}",
+                safe_display(&monitor.output_name),
+                safe_display(&monitor.id),
+                monitor.enabled,
+                monitor.width,
+                monitor.height,
+                monitor.refresh_rate,
+                monitor.x,
+                monitor.y,
+                monitor.scale,
+                monitor.transform
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn safe_display(value: &str) -> String {
+    sanitize_terminal_text(value)
 }
 
 pub fn replan_apply(plan: &ApplyPlan, current: &[MonitorState]) -> anyhow::Result<ApplyPlan> {
-    plan_apply(&plan.profile, current)
+    plan_apply_with_mode(&plan.profile, current, plan.match_mode)
 }
 
 fn render_rollback_snapshot(
@@ -267,10 +585,15 @@ fn render_rollback_snapshot(
 ) -> anyhow::Result<(String, Vec<ExpectedMonitorState>)> {
     let rollback_profile =
         Profile::from_monitors("rollback".to_owned(), current, String::new(), String::new());
-    let rollback_rendered = render_monitor_rules(&rollback_profile, current)
-        .context("failed to capture rollback monitor rules")?;
-    let rollback_expected =
-        expected_monitor_states(&rollback_profile, &rollback_rendered.mappings, true);
+    let rollback_rendered =
+        render_monitor_rules_with_mode(&rollback_profile, current, MonitorMatchMode::Explicit)
+            .context("failed to capture rollback monitor rules")?;
+    let rollback_expected = expected_monitor_states(
+        &rollback_profile,
+        current,
+        &rollback_rendered.mappings,
+        true,
+    );
 
     let disabled_monitor_ids: HashSet<_> = rollback_profile
         .outputs
@@ -289,8 +612,9 @@ fn render_rollback_snapshot(
     for output in &mut configured_profile.outputs {
         output.enabled = true;
     }
-    let configured = render_monitor_rules(&configured_profile, current)
-        .context("failed to capture rollback settings for disabled outputs")?;
+    let configured =
+        render_monitor_rules_with_mode(&configured_profile, current, MonitorMatchMode::Explicit)
+            .context("failed to capture rollback settings for disabled outputs")?;
     let mut rules = configured.rules;
     rules.extend(
         rollback_rendered
@@ -308,7 +632,6 @@ pub fn apply_plan_safely_with_controller(
     client: &mut dyn MonitorController,
     wait: &mut dyn ApplyWait,
     mut confirmation: Option<&mut dyn ApplyConfirmation>,
-    skip_verification: bool,
 ) -> anyhow::Result<ApplyOutcome> {
     ensure_plan_safe_to_apply(plan)?;
     if plan.is_noop {
@@ -319,14 +642,21 @@ pub fn apply_plan_safely_with_controller(
         confirmation.prepare()?;
     }
 
-    apply_plan_with_controller(plan, client, wait, skip_verification)?;
+    apply_plan_with_controller(plan, client, wait)?;
 
     let Some(confirmation) = confirmation else {
         return Ok(ApplyOutcome::Unattended);
     };
 
     match confirmation.confirm(&plan.profile_name, CONFIRMATION_TIMEOUT) {
-        Ok(ConfirmationResult::Confirmed) => Ok(ApplyOutcome::Confirmed),
+        Ok(ConfirmationResult::Confirmed) => {
+            if let Err(error) = verify_state_with_retries(client, wait, &plan.expected) {
+                let reason = format!("monitor state drifted during confirmation: {error:#}");
+                rollback_after_unconfirmed(client, wait, plan, &reason)?;
+                return Ok(ApplyOutcome::RolledBack { reason });
+            }
+            Ok(ApplyOutcome::Confirmed)
+        }
         Ok(result) => {
             let reason = match result {
                 ConfirmationResult::TimedOut => "confirmation timed out",
@@ -334,24 +664,23 @@ pub fn apply_plan_safely_with_controller(
                 ConfirmationResult::EndOfInput => "confirmation input closed",
                 ConfirmationResult::Confirmed => return Ok(ApplyOutcome::Confirmed),
             };
-            rollback_after_unconfirmed(client, wait, plan, reason, skip_verification)?;
+            rollback_after_unconfirmed(client, wait, plan, reason)?;
             Ok(ApplyOutcome::RolledBack {
                 reason: reason.to_owned(),
             })
         }
         Err(error) => {
             let reason = format!("confirmation could not be read: {error:#}");
-            rollback_after_unconfirmed(client, wait, plan, &reason, skip_verification)?;
+            rollback_after_unconfirmed(client, wait, plan, &reason)?;
             Err(error.context("confirmation failed; the previous monitor layout was restored"))
         }
     }
 }
 
-pub fn apply_plan_with_controller(
+fn apply_plan_with_controller(
     plan: &ApplyPlan,
     client: &mut dyn MonitorController,
     wait: &mut dyn ApplyWait,
-    skip_verification: bool,
 ) -> anyhow::Result<()> {
     ensure_plan_safe_to_apply(plan)?;
     if plan.is_noop {
@@ -359,17 +688,7 @@ pub fn apply_plan_with_controller(
     }
 
     if let Err(error) = client.apply_monitor_batch(&plan.batch) {
-        return Err(apply_failure_with_rollback(
-            client,
-            wait,
-            plan,
-            error,
-            skip_verification,
-        ));
-    }
-
-    if skip_verification {
-        return Ok(());
+        return Err(apply_failure_with_rollback(client, wait, plan, error));
     }
 
     if let Err(error) = verify_state_with_retries(client, wait, &plan.expected) {
@@ -378,7 +697,6 @@ pub fn apply_plan_with_controller(
             wait,
             plan,
             error.context("monitor state did not converge after apply"),
-            false,
         ));
     }
 
@@ -390,9 +708,8 @@ fn apply_failure_with_rollback(
     wait: &mut dyn ApplyWait,
     plan: &ApplyPlan,
     error: anyhow::Error,
-    skip_verification: bool,
 ) -> anyhow::Error {
-    match restore_previous_layout(client, wait, plan, skip_verification) {
+    match restore_previous_layout(client, wait, plan) {
         Ok(()) => error.context(format!(
             "failed to apply profile `{}`; the previous monitor layout was restored",
             plan.profile_name
@@ -409,9 +726,8 @@ fn rollback_after_unconfirmed(
     wait: &mut dyn ApplyWait,
     plan: &ApplyPlan,
     reason: &str,
-    skip_verification: bool,
 ) -> anyhow::Result<()> {
-    restore_previous_layout(client, wait, plan, skip_verification).with_context(|| {
+    restore_previous_layout(client, wait, plan).with_context(|| {
         format!(
             "{reason}; failed to restore the previous monitor layout for profile `{}`",
             plan.profile_name
@@ -423,15 +739,12 @@ fn restore_previous_layout(
     client: &mut dyn MonitorController,
     wait: &mut dyn ApplyWait,
     plan: &ApplyPlan,
-    skip_verification: bool,
 ) -> anyhow::Result<()> {
     client
-        .apply_monitor_batch(&plan.rollback_batch)
+        .rollback_monitor_batch(&plan.rollback_batch)
         .context("rollback command was rejected by Hyprland")?;
-    if !skip_verification {
-        verify_state_with_retries(client, wait, &plan.rollback_expected)
-            .context("rollback monitor state did not converge")?;
-    }
+    verify_state_with_retries(client, wait, &plan.rollback_expected)
+        .context("rollback monitor state did not converge")?;
     Ok(())
 }
 
@@ -441,18 +754,26 @@ fn verify_state_with_retries(
     expected: &[ExpectedMonitorState],
 ) -> anyhow::Result<()> {
     let mut last_mismatch = String::new();
+    let mut saw_state_mismatch = false;
+    let mut delay = VERIFY_INITIAL_DELAY;
     for attempt in 0..VERIFY_ATTEMPTS {
         match client.monitors_all() {
             Ok(monitors) => match verify_expected_state(expected, &monitors) {
                 Ok(()) => return Ok(()),
-                Err(error) => last_mismatch = error.to_string(),
+                Err(error) => {
+                    last_mismatch = error.to_string();
+                    saw_state_mismatch = true;
+                }
             },
             Err(error) => {
-                last_mismatch = format!("failed to query monitor state: {error:#}");
+                if !saw_state_mismatch {
+                    last_mismatch = format!("failed to query monitor state: {error:#}");
+                }
             }
         }
         if attempt + 1 < VERIFY_ATTEMPTS {
-            wait.wait(VERIFY_RETRY_DELAY);
+            wait.wait(delay);
+            delay = delay.saturating_mul(2).min(VERIFY_MAX_DELAY);
         }
     }
     bail!("{last_mismatch}")
@@ -460,10 +781,11 @@ fn verify_state_with_retries(
 
 fn expected_monitor_states(
     profile: &Profile,
+    current: &[MonitorState],
     mappings: &[RuleMapping],
     verify_details_when_disabled: bool,
 ) -> Vec<ExpectedMonitorState> {
-    mappings
+    let mut expected: Vec<_> = mappings
         .iter()
         .map(|mapping| {
             let output = profile
@@ -472,6 +794,10 @@ fn expected_monitor_states(
                 .find(|output| output.monitor_id == mapping.monitor_id);
             ExpectedMonitorState {
                 output_name: mapping.output_name.clone(),
+                monitor_id: current
+                    .iter()
+                    .find(|monitor| monitor.output_name == mapping.output_name)
+                    .map_or_else(|| mapping.monitor_id.clone(), |monitor| monitor.id.clone()),
                 enabled: output.is_some_and(|output| output.enabled),
                 mode: output.map_or_else(String::new, |output| output.mode.clone()),
                 x: output.map_or(0, |output| output.x),
@@ -481,20 +807,76 @@ fn expected_monitor_states(
                 verify_details_when_disabled,
             }
         })
-        .collect()
+        .collect();
+    let mapped_names: HashSet<_> = mappings
+        .iter()
+        .map(|mapping| mapping.output_name.as_str())
+        .collect();
+    expected.extend(
+        current
+            .iter()
+            .filter(|monitor| !mapped_names.contains(monitor.output_name.as_str()))
+            .map(|monitor| ExpectedMonitorState {
+                output_name: monitor.output_name.clone(),
+                monitor_id: monitor.id.clone(),
+                enabled: monitor.enabled,
+                mode: format!(
+                    "{}x{}@{}",
+                    monitor.width, monitor.height, monitor.refresh_rate
+                ),
+                x: monitor.x,
+                y: monitor.y,
+                scale: monitor.scale,
+                transform: monitor.transform,
+                verify_details_when_disabled,
+            }),
+    );
+    expected
 }
 
 fn verify_expected_state(
     expected: &[ExpectedMonitorState],
     actual: &[MonitorState],
 ) -> anyhow::Result<()> {
+    if actual.len() != expected.len() {
+        let expected_names: HashSet<_> = expected
+            .iter()
+            .map(|monitor| monitor.output_name.as_str())
+            .collect();
+        let unexpected = actual
+            .iter()
+            .filter(|monitor| !expected_names.contains(monitor.output_name.as_str()))
+            .map(|monitor| monitor.output_name.as_str())
+            .collect::<Vec<_>>();
+        bail!(
+            "monitor topology drifted: expected {} outputs, found {}; unexpected outputs: {}",
+            expected.len(),
+            actual.len(),
+            if unexpected.is_empty() {
+                "none".to_owned()
+            } else {
+                unexpected.join(", ")
+            }
+        );
+    }
     for expected in expected {
         let Some(actual) = actual
             .iter()
             .find(|monitor| monitor.output_name == expected.output_name)
         else {
-            bail!("output `{}` disappeared", expected.output_name);
+            bail!(
+                "monitor topology drifted: output `{}` disappeared or was renamed",
+                expected.output_name
+            );
         };
+        if actual.id != expected.monitor_id {
+            bail!(
+                "monitor topology drifted: output `{}` identity changed from `{}` to `{}`",
+                expected.output_name,
+                expected.monitor_id,
+                actual.id
+            );
+        }
         if actual.enabled != expected.enabled {
             bail!(
                 "output `{}` enabled state is {}, expected {}",
@@ -527,17 +909,6 @@ fn verify_expected_state(
     Ok(())
 }
 
-fn parse_mode(mode: &str) -> Option<(i32, i32, f64)> {
-    let mode = mode.strip_suffix("Hz").unwrap_or(mode);
-    let (dimensions, refresh) = mode.split_once('@')?;
-    let (width, height) = dimensions.split_once('x')?;
-    Some((
-        width.parse().ok()?,
-        height.parse().ok()?,
-        refresh.parse().ok()?,
-    ))
-}
-
 pub fn ensure_plan_safe_to_apply(plan: &ApplyPlan) -> anyhow::Result<()> {
     if plan
         .warnings
@@ -551,118 +922,6 @@ pub fn ensure_plan_safe_to_apply(plan: &ApplyPlan) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn validate_profile_outputs(profile: &Profile) -> anyhow::Result<()> {
-    let mut monitor_ids = HashSet::new();
-    for monitor in &profile.monitors {
-        if monitor.id.trim().is_empty() {
-            bail!(
-                "profile `{}` has monitor metadata without an id",
-                profile.name
-            );
-        }
-        if !monitor_ids.insert(monitor.id.as_str()) {
-            bail!(
-                "profile `{}` has duplicate monitor id `{}`",
-                profile.name,
-                monitor.id
-            );
-        }
-    }
-
-    let mut output_ids = HashSet::new();
-    for output in &profile.outputs {
-        if output.monitor_id.trim().is_empty() {
-            bail!(
-                "profile `{}` has an output without a monitor id",
-                profile.name
-            );
-        }
-        if !output_ids.insert(output.monitor_id.as_str()) {
-            bail!(
-                "profile `{}` has duplicate output for monitor `{}`",
-                profile.name,
-                output.monitor_id
-            );
-        }
-        if !monitor_ids.contains(output.monitor_id.as_str()) {
-            bail!(
-                "profile `{}` output `{}` has no matching monitor identity metadata",
-                profile.name,
-                output.monitor_id
-            );
-        }
-
-        if !valid_mode(&output.mode) {
-            bail!(
-                "profile `{}` output `{}` has invalid mode `{}`; expected preferred, highres, highrr, maxwidth, or WIDTHxHEIGHT@REFRESH",
-                profile.name,
-                output.monitor_id,
-                output.mode
-            );
-        }
-
-        if !output.scale.is_finite() || !(MIN_SCALE..=MAX_SCALE).contains(&output.scale) {
-            bail!(
-                "profile `{}` output `{}` has invalid scale {}; expected {MIN_SCALE}..={MAX_SCALE}",
-                profile.name,
-                output.monitor_id,
-                output.scale
-            );
-        }
-
-        if let Some((width, height, _)) = parse_mode(&output.mode) {
-            validate_logical_output_size(profile, output, width, height)?;
-        }
-
-        if !(0..=7).contains(&output.transform) {
-            bail!(
-                "profile `{}` output `{}` has invalid transform {}; expected 0..=7",
-                profile.name,
-                output.monitor_id,
-                output.transform
-            );
-        }
-    }
-
-    for monitor_id in &monitor_ids {
-        if !output_ids.contains(monitor_id) {
-            bail!(
-                "profile `{}` monitor `{monitor_id}` has no output settings",
-                profile.name
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn valid_mode(mode: &str) -> bool {
-    let trimmed = mode.trim();
-    if trimmed.is_empty() || mode != trimmed {
-        return false;
-    }
-    let mode = trimmed;
-    if matches!(mode, "preferred" | "highres" | "highrr" | "maxwidth") {
-        return true;
-    }
-
-    let Some((dimensions, refresh)) = mode.split_once('@') else {
-        return false;
-    };
-    let Some((width, height)) = dimensions.split_once('x') else {
-        return false;
-    };
-    matches!(
-        (
-            width.parse::<u32>(),
-            height.parse::<u32>(),
-            refresh.parse::<f64>()
-        ),
-        (Ok(width), Ok(height), Ok(refresh))
-            if width > 0 && height > 0 && refresh.is_finite() && refresh > 0.0
-    )
 }
 
 fn validate_mapped_output_scales(
@@ -692,7 +951,7 @@ fn validate_mapped_output_scales(
                     mapping.output_name
                 )
             })?;
-        let (width, height) = resolved_special_mode_dimensions(&output.mode, monitor)?;
+        let (width, height) = resolved_mode_dimensions(&output.mode, monitor)?;
         validate_logical_output_size(profile, output, width, height)?;
     }
     Ok(())
@@ -793,10 +1052,13 @@ fn verify_expected_mode(mode: &str, actual: &MonitorState) -> anyhow::Result<()>
     }
 }
 
-fn resolved_special_mode_dimensions(
+pub(crate) fn resolved_mode_dimensions(
     mode: &str,
     monitor: &MonitorState,
 ) -> anyhow::Result<(i32, i32)> {
+    if let Some((width, height, _)) = parse_mode(mode) {
+        return Ok((width, height));
+    }
     let modes = parsed_available_modes(monitor);
     let selected = match mode {
         "preferred" => modes.first().copied(),
@@ -829,7 +1091,11 @@ fn parsed_available_modes(monitor: &MonitorState) -> Vec<(i32, i32, f64)> {
         .collect()
 }
 
-fn apply_warnings(profile: &Profile) -> Vec<ApplyWarning> {
+fn apply_warnings(
+    profile: &Profile,
+    current: &[MonitorState],
+    mappings: &[RuleMapping],
+) -> Vec<ApplyWarning> {
     let mut warnings = Vec::new();
 
     let enabled_outputs: Vec<_> = profile
@@ -842,12 +1108,12 @@ fn apply_warnings(profile: &Profile) -> Vec<ApplyWarning> {
     }
 
     for (left_index, left) in enabled_outputs.iter().enumerate() {
-        let Some(left_rect) = output_rect(left) else {
+        let Some(left_rect) = output_rect(left, current, mappings) else {
             continue;
         };
 
         for right in enabled_outputs.iter().skip(left_index + 1) {
-            let Some(right_rect) = output_rect(right) else {
+            let Some(right_rect) = output_rect(right, current, mappings) else {
                 continue;
             };
 
@@ -880,8 +1146,20 @@ impl Rect {
     }
 }
 
-fn output_rect(output: &ProfileOutput) -> Option<Rect> {
-    let (mut width, mut height) = parse_mode_dimensions(&output.mode)?;
+fn output_rect(
+    output: &ProfileOutput,
+    current: &[MonitorState],
+    mappings: &[RuleMapping],
+) -> Option<Rect> {
+    let (mut width, mut height) = parse_mode_dimensions(&output.mode).or_else(|| {
+        let mapping = mappings
+            .iter()
+            .find(|mapping| mapping.monitor_id == output.monitor_id)?;
+        let monitor = current
+            .iter()
+            .find(|monitor| monitor.output_name == mapping.output_name)?;
+        resolved_mode_dimensions(&output.mode, monitor).ok()
+    })?;
     if matches!(output.transform, 1 | 3 | 5 | 7) {
         std::mem::swap(&mut width, &mut height);
     }

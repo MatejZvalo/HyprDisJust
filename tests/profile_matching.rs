@@ -5,10 +5,10 @@ use std::process::Command;
 use hyprdisjust::cli::format_auto_apply_dry_run;
 use hyprdisjust::config::AppConfig;
 use hyprdisjust::hyprland::hyprctl::parse_monitors_output;
-use hyprdisjust::hyprland::monitor::MonitorState;
+use hyprdisjust::hyprland::monitor::{infer_identity_provenance, IdentityProvenance, MonitorState};
 use hyprdisjust::profile::r#match::{
     best_profile_match, decide_auto_apply, match_profile, profile_monitor_match_score,
-    AutoApplyDecision, MatchConfidence,
+    AutoApplyDecision, MatchConfidence, HIGH_CONFIDENCE_PAIR_SCORE,
 };
 use hyprdisjust::profile::store::{Profile, ProfileMonitor, ProfileStore};
 use pretty_assertions::assert_eq;
@@ -210,6 +210,50 @@ fn output_name_only_match_is_partial() {
 }
 
 #[test]
+fn connector_fallback_ids_never_become_exact_or_auto_eligible() {
+    let mut current = unknown_monitor();
+    current.id = "output:virtual-1".to_owned();
+    current.make.clear();
+    current.model.clear();
+    current.serial.clear();
+    current.description.clear();
+    let profile = profile_from_monitors("connector", std::slice::from_ref(&current));
+
+    let matched = match_profile(&profile, &[current]);
+
+    assert_eq!(matched.confidence, MatchConfidence::Partial);
+    assert!(!matched.confidence.is_auto_apply_eligible());
+}
+
+#[test]
+fn connector_disambiguated_ids_never_become_high_confidence() {
+    let mut current = unknown_monitor();
+    current.id = "virtual:fallback:no-serial:output:virtual-1".to_owned();
+    current.serial.clear();
+    current.description.clear();
+    let profile = profile_from_monitors("connector", std::slice::from_ref(&current));
+
+    let matched = match_profile(&profile, &[current]);
+
+    assert_eq!(matched.confidence, MatchConfidence::Partial);
+}
+
+#[test]
+fn lossy_slug_collisions_require_raw_physical_corroboration() {
+    let mut current = unknown_monitor();
+    current.id = "virtual:fallback:a-b".to_owned();
+    current.serial = "A B".to_owned();
+    current.description = "current".to_owned();
+    let mut saved = ProfileMonitor::from(&current);
+    saved.serial = "A-B".to_owned();
+    saved.description = "saved".to_owned();
+
+    let (score, _) = profile_monitor_match_score(&saved, &current);
+
+    assert!(score < HIGH_CONFIDENCE_PAIR_SCORE);
+}
+
+#[test]
 fn exact_description_is_the_explicit_high_confidence_threshold() {
     let current = parse_monitors_output(DESK).unwrap();
     let mut profile = profile_from_monitors("desk", &current);
@@ -252,6 +296,53 @@ fn monitor_ambiguity_blocks_configured_fallback() {
     let decision = decide_auto_apply(&store, &best_match, Some("fallback"));
 
     assert!(matches!(decision, AutoApplyDecision::Ambiguous { .. }));
+}
+
+#[test]
+fn equal_partial_profile_tie_blocks_configured_fallback() {
+    let current = vec![unknown_monitor()];
+    let partial_monitor = |id: &str| ProfileMonitor {
+        id: id.to_owned(),
+        name_hint: String::new(),
+        description: "different description".to_owned(),
+        make: "Virtual".to_owned(),
+        model: "Fallback".to_owned(),
+        serial: "different serial".to_owned(),
+        physical_width: 0,
+        physical_height: 0,
+    };
+    let mut store = ProfileStore::default();
+    store.profiles.extend([
+        Profile {
+            name: "partial-a".to_owned(),
+            created_at: "created".to_owned(),
+            updated_at: "updated".to_owned(),
+            monitors: vec![partial_monitor("stale-a")],
+            outputs: vec![],
+        },
+        Profile {
+            name: "partial-b".to_owned(),
+            created_at: "created".to_owned(),
+            updated_at: "updated".to_owned(),
+            monitors: vec![partial_monitor("stale-b")],
+            outputs: vec![],
+        },
+    ]);
+
+    let best_match = best_profile_match(&store, &current);
+    assert!(best_match.ambiguous);
+    assert!(matches!(
+        decide_auto_apply(&store, &best_match, Some("partial-a")),
+        AutoApplyDecision::Ambiguous { .. }
+    ));
+}
+
+#[test]
+fn identity_provenance_does_not_treat_model_text_as_disambiguation() {
+    assert_eq!(
+        infer_identity_provenance("acme:output:123", "Acme", "", "", ""),
+        IdentityProvenance::LegacyUntrusted
+    );
 }
 
 #[test]
@@ -571,7 +662,7 @@ fn apply_auto_dry_run_explains_selected_profile() {
     assert!(stdout.contains("Would select profile: desk"));
     assert!(stdout.contains("Confidence: exact"));
     assert!(stdout.contains(
-        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", disabled = false, mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", disabled = false, mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1, transform = 0 })\""
+        "hyprctl --batch 'eval hl.monitor({ output = \"DP-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })'"
     ));
 }
 
@@ -595,7 +686,7 @@ fn apply_named_dry_run_prints_exact_hyprctl_batch() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Profile: desk"));
     assert!(stdout.contains(
-        "hyprctl --batch \"eval hl.monitor({ output = \\\"DP-1\\\", disabled = false, mode = \\\"2560x1440@144\\\", position = \\\"0x0\\\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \\\"eDP-1\\\", disabled = false, mode = \\\"1920x1200@60\\\", position = \\\"2560x240\\\", scale = 1, transform = 0 })\""
+        "hyprctl --batch 'eval hl.monitor({ output = \"DP-1\", disabled = false, mode = \"2560x1440@144\", position = \"0x0\", scale = 1, transform = 0 }) ; eval hl.monitor({ output = \"eDP-1\", disabled = false, mode = \"1920x1200@60\", position = \"2560x240\", scale = 1, transform = 0 })'"
     ));
 }
 

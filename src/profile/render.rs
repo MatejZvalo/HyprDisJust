@@ -1,7 +1,7 @@
 use anyhow::bail;
 
 use crate::hyprland::monitor::MonitorState;
-use crate::profile::r#match::resolve_monitor_matches;
+use crate::profile::r#match::{resolve_monitor_matches_with_mode, MonitorMatchMode};
 use crate::profile::store::{Profile, ProfileMonitor, ProfileOutput};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,21 @@ pub struct RuleMapping {
 pub fn render_monitor_rules(
     profile: &Profile,
     current: &[MonitorState],
+) -> anyhow::Result<RenderedMonitorRules> {
+    render_monitor_rules_with_mode(profile, current, MonitorMatchMode::Explicit)
+}
+
+pub fn render_monitor_rules_automatic(
+    profile: &Profile,
+    current: &[MonitorState],
+) -> anyhow::Result<RenderedMonitorRules> {
+    render_monitor_rules_with_mode(profile, current, MonitorMatchMode::Automatic)
+}
+
+pub fn render_monitor_rules_with_mode(
+    profile: &Profile,
+    current: &[MonitorState],
+    mode: MonitorMatchMode,
 ) -> anyhow::Result<RenderedMonitorRules> {
     if profile.outputs.is_empty() {
         bail!("profile `{}` has no saved monitor outputs", profile.name);
@@ -52,7 +67,7 @@ pub fn render_monitor_rules(
                 })
         })
         .collect();
-    let resolved = resolve_monitor_matches(&mapping_monitors, current);
+    let resolved = resolve_monitor_matches_with_mode(&mapping_monitors, current, mode);
     let mut used_current = vec![false; current.len()];
     let mut mappings = Vec::with_capacity(current.len().max(profile.outputs.len()));
     let mut rules = Vec::with_capacity(current.len().max(profile.outputs.len()));
@@ -140,7 +155,11 @@ pub fn render_hyprland_lua(rules: &[String]) -> anyhow::Result<String> {
 }
 
 pub fn format_hyprctl_batch_command(batch: &str) -> String {
-    format!("hyprctl --batch \"{}\"", batch.replace('"', "\\\""))
+    format!("hyprctl --batch {}", quote_posix_argument(batch))
+}
+
+fn quote_posix_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn validate_lua_monitor_call(rule: &str) -> anyhow::Result<()> {
@@ -181,8 +200,8 @@ fn render_monitor_rule(output_name: &str, output: &ProfileOutput) -> anyhow::Res
 }
 
 fn validate_batch_component(value: &str, label: &str) -> anyhow::Result<()> {
-    if value.contains(';') || value.contains('\n') || value.contains('\r') {
-        bail!("{label} must not contain command separators");
+    if value.contains(';') || value.chars().any(char::is_control) {
+        bail!("{label} must not contain command separators or control characters");
     }
 
     Ok(())

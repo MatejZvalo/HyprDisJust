@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::config::{AppConfig, ConfigPaths};
 use crate::hyprland::hyprctl::current_monitors;
 use crate::hyprland::ipc::socket2_path_from_env;
-use crate::hyprland::monitor::MonitorState;
+use crate::hyprland::monitor::{IdentityProvenance, MonitorState};
 use crate::profile::r#match::{best_profile_match, decide_auto_apply, format_auto_apply_decision};
 use crate::profile::store::ProfileStore;
 
@@ -30,9 +30,16 @@ pub struct DoctorReport {
     pub monitors: Vec<MonitorState>,
     pub profile_count: usize,
     pub best_profile_summary: Option<String>,
+    pub monitor_query_succeeded: bool,
 }
 
 impl DoctorReport {
+    pub fn has_errors(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.severity == DoctorSeverity::Error)
+    }
+
     pub fn push(
         &mut self,
         severity: DoctorSeverity,
@@ -53,6 +60,7 @@ pub fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
         monitors: Vec::new(),
         profile_count: 0,
         best_profile_summary: None,
+        monitor_query_succeeded: false,
     };
 
     report.push(
@@ -133,6 +141,7 @@ pub fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
 
     match current_monitors() {
         Ok(monitors) => {
+            report.monitor_query_succeeded = true;
             report.push(
                 DoctorSeverity::Ok,
                 "hyprctl monitors",
@@ -245,26 +254,30 @@ fn check_systemd(report: &mut DoctorReport) {
 fn check_monitor_identities(report: &mut DoctorReport, monitors: &[MonitorState]) {
     let mut warned = false;
     for monitor in monitors {
-        if monitor.id.starts_with("output:") {
-            report.push(
-                DoctorSeverity::Warning,
-                "monitor identity",
-                format!(
-                    "{} only has output-name identity `{}`",
-                    monitor.output_name, monitor.id
-                ),
-            );
-            warned = true;
-        } else if monitor.id.contains(":output:") {
-            report.push(
-                DoctorSeverity::Warning,
-                "monitor identity",
-                format!(
-                    "{} needed output-name disambiguation as `{}`",
-                    monitor.output_name, monitor.id
-                ),
-            );
-            warned = true;
+        match monitor.identity_provenance() {
+            IdentityProvenance::ConnectorFallback => {
+                report.push(
+                    DoctorSeverity::Warning,
+                    "monitor identity",
+                    format!(
+                        "{} only has output-name identity `{}`",
+                        monitor.output_name, monitor.id
+                    ),
+                );
+                warned = true;
+            }
+            IdentityProvenance::ConnectorDisambiguated => {
+                report.push(
+                    DoctorSeverity::Warning,
+                    "monitor identity",
+                    format!(
+                        "{} needed output-name disambiguation as `{}`",
+                        monitor.output_name, monitor.id
+                    ),
+                );
+                warned = true;
+            }
+            _ => {}
         }
     }
 

@@ -1,13 +1,18 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::ErrorKind;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
+use crate::atomic::{
+    atomic_write, ensure_private_directory, open_private_lock, read_limited, PRIVATE_FILE_MODE,
+};
 use crate::hyprland::monitor::MonitorState;
+use crate::profile::validation::{
+    validate_profile, validate_profile_name, validate_store, MAX_PROFILE_STORE_BYTES,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,78 +63,65 @@ pub struct ProfileOutput {
 impl ProfileStore {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read profile store at {}", path.display())
-                });
+        if let Err(error) = fs::symlink_metadata(path) {
+            if error.kind() == ErrorKind::NotFound {
+                return Ok(Self::default());
             }
-        };
-        let store: Self = toml::from_str(&contents)
+            return Err(error)
+                .with_context(|| format!("failed to inspect profile store at {}", path.display()));
+        }
+        ensure_private_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        let contents = read_limited(path, MAX_PROFILE_STORE_BYTES, "profile store")?;
+        let contents = std::str::from_utf8(&contents)
+            .with_context(|| format!("profile store at {} is not valid UTF-8", path.display()))?;
+        let store: Self = toml::from_str(contents)
             .with_context(|| format!("failed to parse profile store at {}", path.display()))?;
-        store
-            .validate()
+        validate_store(&store)
             .with_context(|| format!("invalid profile store at {}", path.display()))?;
         Ok(store)
     }
 
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-
+        validate_store(self).context("refusing to save invalid profile store")?;
         let contents = toml::to_string_pretty(self).context("failed to serialize profile store")?;
-        let temp_path = unique_temp_path(path);
-
-        let write_result = (|| -> anyhow::Result<()> {
-            let mut temp_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)
-                .with_context(|| {
-                    format!(
-                        "failed to create temporary profile store {}",
-                        temp_path.display()
-                    )
-                })?;
-            temp_file
-                .write_all(contents.as_bytes())
-                .with_context(|| format!("failed to write {}", temp_path.display()))?;
-            temp_file
-                .sync_all()
-                .with_context(|| format!("failed to sync {}", temp_path.display()))?;
-            fs::rename(&temp_path, path).with_context(|| {
-                format!(
-                    "failed to replace profile store {} with {}",
-                    path.display(),
-                    temp_path.display()
-                )
-            })?;
-            File::open(parent)
-                .with_context(|| {
-                    format!(
-                        "profile store was replaced, but failed to open config directory {} for syncing",
-                        parent.display()
-                    )
-                })?
-                .sync_all()
-                .with_context(|| {
-                    format!(
-                        "profile store was replaced, but failed to sync config directory {}",
-                        parent.display()
-                    )
-                })?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+        if contents.len() as u64 > MAX_PROFILE_STORE_BYTES {
+            bail!("refusing to save profile store larger than {MAX_PROFILE_STORE_BYTES} bytes");
         }
+        atomic_write(path, contents.as_bytes(), PRIVATE_FILE_MODE)
+            .with_context(|| format!("failed to save profile store at {}", path.display()))
+    }
 
-        write_result
+    pub fn mutate_atomic<R>(
+        path: impl AsRef<Path>,
+        mutation: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(Self, R)> {
+        Self::mutate_atomic_with_initial(path, None, mutation)
+    }
+
+    pub fn mutate_atomic_with_initial<R>(
+        path: impl AsRef<Path>,
+        initial: Option<&Self>,
+        mutation: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<(Self, R)> {
+        let path = path.as_ref();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_private_directory(parent)?;
+        let lock_path = path.with_file_name("profiles.lock");
+        let lock_file = open_private_lock(&lock_path, "profile lock")?;
+        lock_file
+            .lock()
+            .with_context(|| format!("failed to lock profile store {}", path.display()))?;
+
+        let mut store = if path.exists() {
+            Self::load(path)?
+        } else {
+            initial.cloned().unwrap_or_default()
+        };
+        let result = mutation(&mut store)?;
+        validate_store(&store).context("profile mutation produced an invalid store")?;
+        store.save_atomic(path)?;
+        Ok((store, result))
     }
 
     pub fn save_current_profile(
@@ -172,6 +164,7 @@ impl ProfileStore {
     pub fn save_profile(&mut self, mut profile: Profile, replace: bool) -> anyhow::Result<String> {
         let name = validate_profile_name(&profile.name)?.to_owned();
         profile.name = name.clone();
+        validate_profile(&profile)?;
 
         let existing_index = self
             .profiles
@@ -303,20 +296,6 @@ impl ProfileStore {
         self.save_profile(profile, replace)?;
         Ok(())
     }
-
-    fn validate(&self) -> anyhow::Result<()> {
-        let mut names = std::collections::HashSet::new();
-        for profile in &self.profiles {
-            let name = validate_profile_name(&profile.name)?;
-            if profile.name != name {
-                bail!("profile name `{}` has surrounding whitespace", profile.name);
-            }
-            if !names.insert(name) {
-                bail!("duplicate profile name `{name}`");
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Profile {
@@ -374,15 +353,6 @@ impl From<&MonitorState> for ProfileOutput {
     }
 }
 
-fn validate_profile_name(name: &str) -> anyhow::Result<&str> {
-    let name = name.trim();
-    if name.is_empty() {
-        bail!("profile name must not be empty");
-    }
-
-    Ok(name)
-}
-
 fn format_mode(width: i32, height: i32, refresh_rate: f64) -> String {
     format!("{}x{}@{}", width, height, format_number(refresh_rate))
 }
@@ -405,17 +375,4 @@ fn timestamp_now() -> String {
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     format!("unix:{seconds}")
-}
-
-fn unique_temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("profiles.toml");
-    let process_id = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_file_name(format!(".{file_name}.{process_id}.{nanos}.tmp"))
 }

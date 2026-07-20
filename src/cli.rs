@@ -7,11 +7,11 @@ use clap_complete::{generate, Shell};
 
 use crate::config::{write_generated_file, AppConfig, ConfigPaths};
 use crate::daemon::DaemonOptions;
-use crate::hyprland::hyprctl::{current_monitors, live_monitors};
+use crate::hyprland::hyprctl::current_monitors;
 use crate::hyprland::monitor::MonitorState;
 use crate::profile::apply::{
-    apply_plan_safely, ensure_plan_safe_to_apply, plan_apply, ApplyOutcome, ApplyPlan,
-    TerminalConfirmation,
+    ensure_plan_safe_to_apply, execute_apply_transaction, plan_apply, plan_apply_automatic,
+    ApplyOutcome, ApplyPlan, ApplyTransactionRequest, ApplyTransactionResult, TerminalConfirmation,
 };
 use crate::profile::r#match::{
     best_profile_match, decide_auto_apply, format_auto_apply_decision, AutoApplyDecision,
@@ -20,10 +20,12 @@ use crate::profile::r#match::{
 use crate::profile::render::{format_hyprctl_batch_command, render_hyprland_lua};
 use crate::profile::store::Profile;
 use crate::profile::store::ProfileStore;
+use crate::profile::validation::validate_profile_name;
 use crate::systemd::{install_user_service, SystemdInstallOptions};
+use crate::text::{write_stdout, write_stdout_line};
 
 #[derive(Debug, Parser)]
-#[command(name = "hyprdisjust")]
+#[command(name = "hyprdisjust", version)]
 #[command(about = "Hyprland monitor profile manager")]
 pub struct Cli {
     #[command(subcommand)]
@@ -137,31 +139,42 @@ enum ExportFormat {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    match run_inner() {
+        Err(error) if is_broken_pipe(&error) => Ok(()),
+        result => result,
+    }
+}
+
+fn run_inner() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Doctor => {
             let paths = ConfigPaths::resolve()?;
             let report = crate::doctor::build_doctor_report(&paths);
-            println!("{}", format_doctor_report(&report));
+            write_stdout_line(&format_doctor_report(&report))?;
+            if report.has_errors() {
+                bail!("doctor found one or more errors");
+            }
         }
         Commands::List => {
             let paths = ConfigPaths::resolve()?;
             let store = ProfileStore::load(paths.profile_store_path())?;
-            println!("{}", format_profile_list(&store));
+            write_stdout_line(&format_profile_list(&store))?;
         }
         Commands::Save { name, replace } => {
             let paths = ConfigPaths::resolve()?;
             let monitors = current_monitors()?;
-            let mut store = ProfileStore::load(paths.profile_store_path())?;
-            let saved_name = store.save_current_profile(name.as_deref(), &monitors, replace)?;
-            store.save_atomic(paths.profile_store_path())?;
-            println!(
+            let (_, saved_name) =
+                ProfileStore::mutate_atomic(paths.profile_store_path(), |store| {
+                    store.save_current_profile(name.as_deref(), &monitors, replace)
+                })?;
+            write_stdout_line(&format!(
                 "Saved profile `{}` with {} monitor{}.",
                 saved_name,
                 monitors.len(),
                 if monitors.len() == 1 { "" } else { "s" }
-            );
+            ))?;
         }
         Commands::Rename { old, new } => run_rename(&old, &new)?,
         Commands::Delete { name, yes } => run_delete(&name, yes)?,
@@ -195,41 +208,50 @@ pub fn run() -> anyhow::Result<()> {
             dry_run,
             unattended,
         } => run_install_systemd_user(enable, start, dry_run, unattended)?,
-        Commands::Completions { shell } => print!("{}", render_completions(shell)?),
+        Commands::Completions { shell } => write_stdout(&render_completions(shell)?)?,
     }
 
     Ok(())
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 fn run_rename(old: &str, new: &str) -> anyhow::Result<()> {
     let paths = ConfigPaths::resolve()?;
-    let mut store = ProfileStore::load(paths.profile_store_path())?;
-    store.rename_profile(old, new)?;
-    store.save_atomic(paths.profile_store_path())?;
-    println!("Renamed profile `{old}` to `{new}`.");
+    ProfileStore::mutate_atomic(paths.profile_store_path(), |store| {
+        store.rename_profile(old, new)
+    })?;
+    write_stdout_line(&format!("Renamed profile `{old}` to `{new}`."))?;
     Ok(())
 }
 
 fn run_delete(name: &str, yes: bool) -> anyhow::Result<()> {
+    validate_profile_name(name)?;
     if !yes && !confirm_delete(name)? {
-        println!("Delete cancelled.");
+        write_stdout_line("Delete cancelled.")?;
         return Ok(());
     }
 
     let paths = ConfigPaths::resolve()?;
-    let mut store = ProfileStore::load(paths.profile_store_path())?;
-    store.delete_profile(name)?;
-    store.save_atomic(paths.profile_store_path())?;
-    println!("Deleted profile `{name}`.");
+    ProfileStore::mutate_atomic(paths.profile_store_path(), |store| {
+        store.delete_profile(name).map(|_| ())
+    })?;
+    write_stdout_line(&format!("Deleted profile `{name}`."))?;
     Ok(())
 }
 
 fn run_copy(source: &str, destination: &str, replace: bool) -> anyhow::Result<()> {
     let paths = ConfigPaths::resolve()?;
-    let mut store = ProfileStore::load(paths.profile_store_path())?;
-    store.copy_profile(source, destination, replace)?;
-    store.save_atomic(paths.profile_store_path())?;
-    println!("Copied profile `{source}` to `{destination}`.");
+    ProfileStore::mutate_atomic(paths.profile_store_path(), |store| {
+        store.copy_profile(source, destination, replace)
+    })?;
+    write_stdout_line(&format!("Copied profile `{source}` to `{destination}`."))?;
     Ok(())
 }
 
@@ -238,7 +260,7 @@ fn confirm_delete(name: &str) -> anyhow::Result<bool> {
         bail!("delete requires --yes when stdin is not an interactive terminal");
     }
 
-    print!("Delete profile `{name}`? type `yes` to confirm: ");
+    write_stdout(&format!("Delete profile `{name}`? type `yes` to confirm: "))?;
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -257,7 +279,7 @@ fn run_tui() -> anyhow::Result<()> {
     } else {
         let model =
             crate::tui::initial_model(&store, &monitors, config.fallback_profile.as_deref())?;
-        println!("{}", crate::tui::format_snapshot(&model));
+        write_stdout_line(&crate::tui::format_snapshot(&model))?;
         Ok(())
     }
 }
@@ -277,13 +299,19 @@ fn run_apply(
 
     if let Some(name) = name {
         let profile = profile_by_name(&store, name)?;
-        let monitors = if dry_run {
-            current_monitors()?
-        } else {
-            live_monitors()?
-        };
+        if !dry_run {
+            let result = run_live_transaction(
+                paths.profile_store_path(),
+                ApplyTransactionRequest::Named(name.to_owned()),
+                unattended,
+            )?;
+            print_apply_warnings(&result.plan)?;
+            print_apply_outcome(&result.plan, &result.outcome)?;
+            return Ok(());
+        }
+        let monitors = current_monitors()?;
         let plan = plan_apply(profile, &monitors)?;
-        apply_or_print(&plan, &monitors, dry_run, unattended)?;
+        write_stdout_line(&format_apply_commands(&plan))?;
         return Ok(());
     }
 
@@ -291,33 +319,48 @@ fn run_apply(
         bail!("`apply` requires a profile name or --auto");
     }
 
-    let monitors = if dry_run {
-        current_monitors()?
-    } else {
-        live_monitors()?
-    };
     let config = AppConfig::load(paths.config_file_path())?;
-    let best_match = best_profile_match(&store, &monitors);
-
-    if dry_run {
-        let mut output =
-            format_auto_apply_dry_run(&best_match, &store, config.fallback_profile.as_deref());
-        let decision = decide_auto_apply(&store, &best_match, config.fallback_profile.as_deref());
-        if let Some(profile_name) = decision.profile_name() {
-            let profile = profile_by_name(&store, profile_name)?;
-            let plan = plan_apply(profile, &monitors)?;
-            output.push_str("\n\n");
-            output.push_str(&format_apply_commands(&plan));
-        } else {
-            output.push_str("\n\nCommands: none");
-        }
-        println!("{output}");
+    if !dry_run {
+        let result = run_live_transaction(
+            paths.profile_store_path(),
+            ApplyTransactionRequest::Automatic {
+                fallback_profile: config.fallback_profile,
+            },
+            unattended,
+        )?;
+        print_apply_warnings(&result.plan)?;
+        print_apply_outcome(&result.plan, &result.outcome)?;
         return Ok(());
     }
+    let monitors = current_monitors()?;
+    let best_match = best_profile_match(&store, &monitors);
 
-    let profile = require_auto_profile(&store, &best_match, config.fallback_profile.as_deref())?;
-    let plan = plan_apply(profile, &monitors)?;
-    apply_or_print(&plan, &monitors, dry_run, unattended)
+    let mut output =
+        format_auto_apply_dry_run(&best_match, &store, config.fallback_profile.as_deref());
+    let decision = decide_auto_apply(&store, &best_match, config.fallback_profile.as_deref());
+    if let Some(profile_name) = decision.profile_name() {
+        let profile = profile_by_name(&store, profile_name)?;
+        let plan = plan_apply_automatic(profile, &monitors)?;
+        output.push_str("\n\n");
+        output.push_str(&format_apply_commands(&plan));
+    } else {
+        output.push_str("\n\nCommands: none");
+    }
+    write_stdout_line(&output)?;
+    Ok(())
+}
+
+fn run_live_transaction(
+    profile_store_path: &std::path::Path,
+    request: ApplyTransactionRequest,
+    unattended: bool,
+) -> anyhow::Result<ApplyTransactionResult> {
+    if unattended {
+        execute_apply_transaction(profile_store_path, request, None)
+    } else {
+        let mut confirmation = TerminalConfirmation;
+        execute_apply_transaction(profile_store_path, request, Some(&mut confirmation))
+    }
 }
 
 fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
@@ -325,25 +368,36 @@ fn run_export(name: Option<&str>, format: ExportFormat) -> anyhow::Result<()> {
     let store = ProfileStore::load(paths.profile_store_path())?;
     let monitors = current_monitors()?;
 
-    let profile = match name {
-        Some(name) => profile_by_name(&store, name)?,
+    let (profile, automatic) = match name {
+        Some(name) => (profile_by_name(&store, name)?, false),
         None => {
             let config = AppConfig::load(paths.config_file_path())?;
             let best_match = best_profile_match(&store, &monitors);
-            require_auto_profile(&store, &best_match, config.fallback_profile.as_deref())?
+            (
+                require_auto_profile(&store, &best_match, config.fallback_profile.as_deref())?,
+                true,
+            )
         }
     };
 
-    let plan = plan_apply(profile, &monitors)?;
+    let plan = if automatic {
+        plan_apply_automatic(profile, &monitors)?
+    } else {
+        plan_apply(profile, &monitors)?
+    };
     ensure_plan_safe_to_apply(&plan)?;
-    print_apply_warnings(&plan);
+    print_apply_warnings(&plan)?;
     let path = match format {
         ExportFormat::Lua => paths.generated_monitors_lua_path(),
     };
     let contents = render_hyprland_lua(&plan.rules)?;
 
     write_generated_file(&path, &contents)?;
-    println!("Exported profile `{}` to {}.", profile.name, path.display());
+    write_stdout_line(&format!(
+        "Exported profile `{}` to {}.",
+        profile.name,
+        path.display()
+    ))?;
     Ok(())
 }
 
@@ -361,33 +415,34 @@ fn run_install_systemd_user(
     })?;
 
     if dry_run {
-        println!(
+        write_stdout_line(&format!(
             "Would write systemd user service to {}:\n{}",
             result.service_path.display(),
             result.service_contents
-        );
+        ))?;
         return Ok(());
     }
 
-    println!(
+    write_stdout_line(&format!(
         "Installed systemd user service at {}.",
         result.service_path.display()
-    );
+    ))?;
     if !unattended {
-        println!(
-            "Safety: service installed without --unattended; it will refuse changed layouts because no confirmation terminal is available."
-        );
+        write_stdout_line(
+            "Safety: service installed without --unattended; it will refuse changed layouts because no confirmation terminal is available.",
+        )?;
     }
     if result.enabled {
-        println!("Enabled hyprdisjust.service.");
+        write_stdout_line("Enabled hyprdisjust.service.")?;
     }
     if result.started {
-        println!("Started hyprdisjust.service.");
+        write_stdout_line("Started hyprdisjust.service.")?;
     }
     Ok(())
 }
 
 fn profile_by_name<'a>(store: &'a ProfileStore, name: &str) -> anyhow::Result<&'a Profile> {
+    validate_profile_name(name)?;
     store
         .profiles
         .iter()
@@ -416,58 +471,30 @@ fn require_auto_profile<'a>(
     }
 }
 
-fn apply_or_print(
-    plan: &ApplyPlan,
-    previous_monitors: &[MonitorState],
-    dry_run: bool,
-    unattended: bool,
-) -> anyhow::Result<()> {
-    if dry_run {
-        println!("{}", format_apply_commands(plan));
-        return Ok(());
-    }
-
-    print_apply_warnings(plan);
-
-    let outcome = if unattended {
-        apply_plan_safely(plan, None)
-    } else {
-        let mut confirmation = TerminalConfirmation;
-        apply_plan_safely(plan, Some(&mut confirmation))
-    };
-    let outcome = outcome.map_err(|error| {
-        anyhow::anyhow!(
-            "{error:#}\nPrevious layout:\n{}",
-            format_doctor(previous_monitors)
-        )
-    })?;
-
-    print_apply_outcome(plan, &outcome);
-    Ok(())
-}
-
-fn print_apply_outcome(plan: &ApplyPlan, outcome: &ApplyOutcome) {
+fn print_apply_outcome(plan: &ApplyPlan, outcome: &ApplyOutcome) -> anyhow::Result<()> {
     let rule_count = plan.rules.len();
-    match outcome {
-        ApplyOutcome::Noop => println!(
+    let message = match outcome {
+        ApplyOutcome::Noop => format!(
             "No changes: profile `{}` is already active.",
             plan.profile_name
         ),
-        ApplyOutcome::Confirmed => println!(
+        ApplyOutcome::Confirmed => format!(
             "Confirmed profile `{}` with {rule_count} monitor rule{}.",
             plan.profile_name,
             if rule_count == 1 { "" } else { "s" }
         ),
-        ApplyOutcome::Unattended => println!(
+        ApplyOutcome::Unattended => format!(
             "Applied profile `{}` with {rule_count} monitor rule{} without confirmation (--unattended).",
             plan.profile_name,
             if rule_count == 1 { "" } else { "s" }
         ),
-        ApplyOutcome::RolledBack { reason } => println!(
+        ApplyOutcome::RolledBack { reason } => format!(
             "Profile `{}` was not confirmed ({reason}); previous monitor layout restored.",
             plan.profile_name
         ),
-    }
+    };
+    write_stdout_line(&message)?;
+    Ok(())
 }
 
 fn format_apply_commands(plan: &ApplyPlan) -> String {
@@ -491,10 +518,11 @@ fn format_apply_commands(plan: &ApplyPlan) -> String {
     output
 }
 
-fn print_apply_warnings(plan: &ApplyPlan) {
+fn print_apply_warnings(plan: &ApplyPlan) -> anyhow::Result<()> {
     if !plan.warnings.is_empty() {
-        println!("{}", format_apply_warnings(plan));
+        write_stdout_line(&format_apply_warnings(plan))?;
     }
+    Ok(())
 }
 
 fn format_apply_warnings(plan: &ApplyPlan) -> String {
@@ -574,13 +602,13 @@ pub fn format_doctor_report(report: &crate::doctor::DoctorReport) -> String {
         output.push_str(&format!(
             "\n[{}] {}: {}",
             format_doctor_severity(check.severity),
-            check.label,
-            check.message
+            sanitize_terminal_text(&check.label),
+            sanitize_terminal_text(&check.message)
         ));
     }
 
     output.push_str("\n\n");
-    if report.monitors.is_empty() {
+    if report.monitors.is_empty() && !report.monitor_query_succeeded {
         output.push_str("Hyprland: not detected\nMonitors: 0");
     } else {
         output.push_str(&format_doctor(&report.monitors));
@@ -608,9 +636,16 @@ pub fn format_doctor(monitors: &[MonitorState]) -> String {
 
     for (index, monitor) in monitors.iter().enumerate() {
         output.push_str("\n\n");
-        output.push_str(&format!("{}. {}\n", index + 1, monitor.output_name));
-        output.push_str(&format!("   id: {}\n", monitor.id));
-        output.push_str(&format!("   description: {}\n", monitor.description));
+        output.push_str(&format!(
+            "{}. {}\n",
+            index + 1,
+            sanitize_terminal_text(&monitor.output_name)
+        ));
+        output.push_str(&format!("   id: {}\n", sanitize_terminal_text(&monitor.id)));
+        output.push_str(&format!(
+            "   description: {}\n",
+            sanitize_terminal_text(&monitor.description)
+        ));
         output.push_str(&format!(
             "   mode: {}x{}@{}\n",
             monitor.width,
@@ -625,6 +660,10 @@ pub fn format_doctor(monitors: &[MonitorState]) -> String {
     }
 
     output
+}
+
+pub fn sanitize_terminal_text(value: &str) -> String {
+    crate::text::sanitize_terminal_text(value)
 }
 
 fn format_number(value: f64) -> String {
